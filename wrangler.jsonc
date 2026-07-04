@@ -1,0 +1,37 @@
+{
+  "name": "gemplan",
+  "main": "src/worker.js",
+  "workers_dev": true,
+  "preview_urls": false,
+  "compatibility_date": "2026-05-21",
+  "routes": [
+    {
+      "pattern": "gemplan.newrst.qzz.io",
+      "zone_name": "newrst.qzz.io",
+      "custom_domain": true,
+      "enabled": true,
+      "previews_enabled": false
+    }
+  ],
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1,
+    "logs": {
+      "enabled": true,
+      "head_sampling_rate": 1,
+      "persist": true,
+      "invocation_logs": true
+    },
+    "traces": {
+      "enabled": false,
+      "persist": true,
+      "head_sampling_rate": 1
+    }
+  },
+  "kv_namespaces": [
+    {
+      "id": "0926be80bb384536b2345e636f8dd4fb",
+      "binding": "GEMINI_KV"
+    }
+  ]
+}
