@@ -1787,6 +1787,14 @@ async function handleApiProxy(request, env, ctx, customPath, apiType) {
     }
     systemInstructionText = systemInstructions.filter(Boolean).join("\n\n");
     const filteredMessages = body.messages.filter((m) => m.role !== "system" && m.role !== "developer");
+    for (const fm of filteredMessages) {
+      if (fm.content && typeof fm.content === "string") {
+        const t = fm.content.trim();
+        if (t.startsWith("[") && t.endsWith("]")) {
+          try { const parsed = JSON.parse(t); if (Array.isArray(parsed)) fm.content = parsed; } catch (e) {}
+        }
+      }
+    }
     const mergedMessages = mergeOpenAIMessages(filteredMessages);
     const toolIdToName = {};
     for (const msg of mergedMessages) {
@@ -1818,17 +1826,19 @@ async function handleApiProxy(request, env, ctx, customPath, apiType) {
               if (block.text && block.text.trim() !== "") {
                 parts.push({ text: block.text });
               }
-            } else if (block.type === "image_url" && block.image_url?.url) {
-              const imgUrl = block.image_url.url;
-              if (imgUrl.startsWith("data:")) {
-                const commaIdx = imgUrl.indexOf(",");
-                if (commaIdx !== -1) {
-                  const mimeType = imgUrl.substring(5, imgUrl.indexOf(";")) || "image/jpeg";
-                  const data = imgUrl.substring(commaIdx + 1);
-                  parts.push({ inlineData: { mimeType, data } });
+            } else if (block.type === "image_url" || block.type === "input_image") {
+              const imgUrl = typeof block.image_url === "string" ? block.image_url : block.image_url?.url;
+              if (imgUrl) {
+                if (imgUrl.startsWith("data:")) {
+                  const commaIdx = imgUrl.indexOf(",");
+                  if (commaIdx !== -1) {
+                    const mimeType = imgUrl.substring(5, imgUrl.indexOf(";")) || "image/jpeg";
+                    const data = imgUrl.substring(commaIdx + 1);
+                    parts.push({ inlineData: { mimeType, data } });
+                  }
+                } else {
+                  parts.push({ fileData: { fileUri: imgUrl, mimeType: "image/jpeg" } });
                 }
-              } else {
-                parts.push({ fileData: { fileUri: imgUrl, mimeType: "image/jpeg" } });
               }
             }
           }
@@ -1859,13 +1869,45 @@ async function handleApiProxy(request, env, ctx, customPath, apiType) {
       if (m.role === "tool") {
         const name = m.name || toolIdToName[m.tool_call_id] || "unknown";
         const finalName = m.tool_call_id ? toolIdToName[m.tool_call_id] || name : name;
-        parts.push({
-          functionResponse: {
-            name: finalName,
-            response: { result: m.content || "" },
-            id: m.tool_call_id || ""
+        if (Array.isArray(m.content)) {
+          const textParts = [];
+          for (const blk of m.content) {
+            if (blk.type === "text" && blk.text) {
+              textParts.push(blk.text);
+            } else if (blk.type === "image_url" || blk.type === "input_image") {
+              const imgUrl = typeof blk.image_url === "string" ? blk.image_url : blk.image_url?.url;
+              if (imgUrl) {
+                if (imgUrl.startsWith("data:")) {
+                  const commaIdx = imgUrl.indexOf(",");
+                  if (commaIdx !== -1) {
+                    const mimeType = imgUrl.substring(5, imgUrl.indexOf(";")) || "image/jpeg";
+                    const data = imgUrl.substring(commaIdx + 1);
+                    parts.push({ inlineData: { mimeType, data } });
+                  }
+                } else {
+                  parts.push({ fileData: { fileUri: imgUrl, mimeType: blk.media_type || "image/jpeg" } });
+                }
+              }
+            }
           }
-        });
+          if (textParts.length > 0) {
+            parts.push({
+              functionResponse: {
+                name: finalName,
+                response: { result: textParts.join("\n") },
+                id: m.tool_call_id || ""
+              }
+            });
+          }
+        } else {
+          parts.push({
+            functionResponse: {
+              name: finalName,
+              response: { result: m.content || "" },
+              id: m.tool_call_id || ""
+            }
+          });
+        }
       }
       return {
         role: m.role === "assistant" ? "model" : "user",
@@ -1888,7 +1930,16 @@ async function handleApiProxy(request, env, ctx, customPath, apiType) {
       }
     }
     systemInstructionText = systemInstructions.filter(Boolean).join("\n\n");
-    const mergedMessages = mergeClaudeMessages(body.messages || []);
+    const rawClaude = (body.messages || []).map((m) => {
+      if (m.content && typeof m.content === "string") {
+        const t = m.content.trim();
+        if (t.startsWith("[") && t.endsWith("]")) {
+          try { const parsed = JSON.parse(t); if (Array.isArray(parsed)) m.content = parsed; } catch (e) {}
+        }
+      }
+      return m;
+    });
+    const mergedMessages = mergeClaudeMessages(rawClaude);
     const toolIdToName = {};
     for (const msg of mergedMessages) {
       if (Array.isArray(msg.content)) {
@@ -1901,70 +1952,109 @@ async function handleApiProxy(request, env, ctx, customPath, apiType) {
     }
     const actualIncludeThinking = shouldEnableThinking(body, resolvedModel, apiType);
     const cachedSig = await getSessionSignature(env, sessionId);
-    contents = mergedMessages.map((m) => {
-      const parts = [];
+    const finalContents = [];
+    for (const m of mergedMessages) {
       let blocks = [];
       if (typeof m.content === "string") {
         blocks = [{ type: "text", text: m.content }];
       } else if (Array.isArray(m.content)) {
         blocks = sortClaudeBlocks(m.content);
       }
+      const toolResultBlocks = [];
+      const otherBlocks = [];
       for (const block of blocks) {
-        if (block.type === "thinking") {
-          // Skip thinking blocks in history to bypass invalid thinking signature errors
-        } else if (block.type === "redacted_thinking") {
-          // Skip redacted thinking blocks in history to bypass invalid thinking signature errors
-        } else if (block.type === "text") {
-          if (block.text && block.text.trim() !== "") {
-            parts.push({ text: block.text });
-          }
-        } else if (block.type === "image" && block.source) {
-          parts.push({
-            inlineData: {
-              mimeType: block.source.media_type || "image/jpeg",
-              data: block.source.data || ""
+        if (block.type === "tool_result") {
+          toolResultBlocks.push(block);
+        } else {
+          otherBlocks.push(block);
+        }
+      }
+      const convertBlocksToParts = (blocksToConvert) => {
+        const parts = [];
+        for (const block of blocksToConvert) {
+          if (block.type === "thinking") {
+            // Skip thinking blocks in history to bypass invalid thinking signature errors
+          } else if (block.type === "redacted_thinking") {
+            // Skip redacted thinking blocks in history to bypass invalid thinking signature errors
+          } else if (block.type === "text") {
+            if (block.text && block.text.trim() !== "") {
+              parts.push({ text: block.text });
             }
-          });
-        } else if (block.type === "tool_use") {
-          let name = block.name;
-          if (name === "local_shell_call") name = "shell";
-          const funcPart = {
-            functionCall: {
-              name,
-              args: block.input || {},
-              id: block.id
+          } else if (block.type === "image" && block.source) {
+            parts.push({
+              inlineData: {
+                mimeType: block.source.media_type || "image/jpeg",
+                data: block.source.data || ""
+              }
+            });
+          } else if (block.type === "tool_use") {
+            let name = block.name;
+            if (name === "local_shell_call") name = "shell";
+            const funcPart = {
+              functionCall: {
+                name,
+                args: block.input || {},
+                id: block.id
+              }
+            };
+            parts.push(funcPart);
+          } else if (block.type === "tool_result") {
+            const name = toolIdToName[block.tool_use_id] || "unknown";
+            let resultText = "";
+            if (typeof block.content === "string") {
+              resultText = block.content;
+            } else if (Array.isArray(block.content)) {
+              for (const rb of block.content) {
+                if (rb.type === "text" && rb.text) {
+                  resultText += (resultText ? "\n" : "") + rb.text;
+                } else if (rb.type === "image" && rb.source) {
+                  parts.push({ inlineData: { mimeType: rb.source.media_type || "image/jpeg", data: rb.source.data || "" } });
+                } else if (rb.type === "image_url" || rb.type === "input_image") {
+                  const imgUrl = typeof rb.image_url === "string" ? rb.image_url : rb.image_url?.url;
+                  if (imgUrl) {
+                    if (imgUrl.startsWith("data:")) {
+                      const commaIdx = imgUrl.indexOf(",");
+                      if (commaIdx !== -1) {
+                        parts.push({ inlineData: { mimeType: imgUrl.substring(5, imgUrl.indexOf(";")) || "image/jpeg", data: imgUrl.substring(commaIdx + 1) } });
+                      }
+                    } else {
+                      parts.push({ fileData: { fileUri: imgUrl, mimeType: rb.media_type || "image/jpeg" } });
+                    }
+                  }
+                }
+              }
             }
-          };
-          if (actualIncludeThinking) {
-            // Skip attaching fake thought signatures to function calls to bypass Vertex Claude signature validation errors
+            parts.push({
+              functionResponse: {
+                name,
+                response: { result: resultText },
+                id: block.tool_use_id || ""
+              }
+            });
           }
-          parts.push(funcPart);
-        } else if (block.type === "tool_result") {
-          const name = toolIdToName[block.tool_use_id] || "unknown";
-          let resultText = "";
-          if (typeof block.content === "string") {
-            resultText = block.content;
-          } else if (Array.isArray(block.content)) {
-            resultText = block.content.map((b) => b.text || "").join("\n");
-          }
-          parts.push({
-            functionResponse: {
-              name,
-              response: { result: resultText },
-              id: block.tool_use_id || ""
-            }
+        }
+        return parts;
+      };
+      if (toolResultBlocks.length > 0) {
+        const toolParts = convertBlocksToParts(toolResultBlocks);
+        if (toolParts.length > 0) {
+          finalContents.push({
+            role: "user",
+            parts: toolParts
           });
         }
       }
-      const hasThought = parts.some((p) => p["thought"] === true);
-      if (actualIncludeThinking && m.role === "assistant" && !hasThought) {
-        // Skip placeholder thinking block in history to avoid signature validation errors
+      if (otherBlocks.length > 0) {
+        const otherParts = convertBlocksToParts(otherBlocks);
+        if (otherParts.length > 0) {
+          finalContents.push({
+            role: m.role === "assistant" ? "model" : "user",
+            parts: otherParts
+          });
+        }
       }
-      return {
-        role: m.role === "assistant" ? "model" : "user",
-        parts
-      };
-    }).filter((c) => c.parts.length > 0);
+    }
+    contents = finalContents;
     const isClaude = resolvedModel.toLowerCase().includes("claude");
     toolsPayload = mapTools(body, "claude", !isClaude, isClaude);
   } else {
