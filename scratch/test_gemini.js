@@ -1,6 +1,7 @@
 async function test() {
   const url = 'https://gemplan.newrst.qzz.io/imandyrrr/v1beta/models/gemini-2.5-flash:streamGenerateContent';
-  const apiKey = 'YOUR_GEMPLAN_API_KEY';
+  const apiKey = process.env.GEMPLAN_API_KEY;
+  if (!apiKey) throw new Error('Set GEMPLAN_API_KEY before running this test');
   
   const payload = {
     contents: [

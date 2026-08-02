@@ -136,6 +136,21 @@ function jsonResponse(data, status = 200) {
 }
 __name(jsonResponse, "jsonResponse");
 __name2(jsonResponse, "jsonResponse");
+function hasNonWhitespace(text) {
+  return typeof text === "string" && /\S/u.test(text);
+}
+__name(hasNonWhitespace, "hasNonWhitespace");
+__name2(hasNonWhitespace, "hasNonWhitespace");
+function trimForStructuralParse(text) {
+  const start = text.search(/\S/u);
+  if (start === -1) return "";
+  let end = text.length - 1;
+  while (end >= start && /\s/u.test(text[end])) end--;
+  if (start === 0 && end === text.length - 1) return text;
+  return start <= end ? text.slice(start, end + 1) : "";
+}
+__name(trimForStructuralParse, "trimForStructuralParse");
+__name2(trimForStructuralParse, "trimForStructuralParse");
 var sleep = /* @__PURE__ */ __name2((ms) => new Promise((resolve) => setTimeout(resolve, ms)), "sleep");
 function collectAllDefs(schema) {
   const map = {};
@@ -684,7 +699,6 @@ function mapTools(body, apiType, needsUppercase = true, preserveDraft2020 = fals
 __name(mapTools, "mapTools");
 __name2(mapTools, "mapTools");
 async function callUpstream(method, requestHeaders, payload, isStream) {
-
   const baseUrls = [
     "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal",
     "https://daily-cloudcode-pa.googleapis.com/v1internal",
@@ -692,6 +706,7 @@ async function callUpstream(method, requestHeaders, payload, isStream) {
   ];
   let hasTriggeredDowngrade = false;
   let headersCopy = { ...requestHeaders };
+  let serializedPayload = JSON.stringify(payload);
   while (true) {
     let lastError = null;
     let shouldRetryWithoutHeader = false;
@@ -706,7 +721,7 @@ async function callUpstream(method, requestHeaders, payload, isStream) {
         const response = await fetch(url, {
           method: "POST",
           headers: headersCopy,
-          body: JSON.stringify(payload)
+          body: serializedPayload
         });
         if (response.ok) {
           return response;
@@ -718,6 +733,9 @@ async function callUpstream(method, requestHeaders, payload, isStream) {
         }
         const isRetryable = status === 429 || status === 408 || status === 404 || status >= 500;
         if (hasNext && isRetryable) {
+          if (response.body) {
+            await response.body.cancel();
+          }
           lastError = `Upstream ${baseUrl} returned status ${status}`;
           continue;
         }
@@ -734,6 +752,7 @@ async function callUpstream(method, requestHeaders, payload, isStream) {
       delete headersCopy["x-goog-user-project"];
       if (payload && payload.project) {
         payload.project = "";
+        serializedPayload = JSON.stringify(payload);
       }
       hasTriggeredDowngrade = true;
       continue;
@@ -752,6 +771,8 @@ async function processStream(readableStream, writableStream, apiType, modelName,
   let claudeStarted = false;
   let claudeTextIndex = 0;
   let currentBlockType = null;
+  let lastQueuedSignature = null;
+  let cachedSignaturePromise = null;
   try {
     while (true) {
       const { done, value } = await reader.read();
@@ -772,7 +793,8 @@ async function processStream(readableStream, writableStream, apiType, modelName,
           if (Array.isArray(parts) && sessionId && env && ctx) {
             for (const part of parts) {
               const sig = part["thoughtSignature"] || part["thought_signature"];
-              if (sig && sig.length >= 50) {
+              if (sig && sig.length >= 50 && sig !== lastQueuedSignature) {
+                lastQueuedSignature = sig;
                 ctx.waitUntil(cacheSessionSignature(env, sessionId, sig, messageCount));
               }
             }
@@ -890,7 +912,10 @@ async function processStream(readableStream, writableStream, apiType, modelName,
 `));
                         claudeTextIndex++;
                       }
-                      const sig = part["thoughtSignature"] || part["thought_signature"] || (sessionId ? await getSessionSignature(env, sessionId) : null) || "skip_thought_signature_validator";
+                      if (!cachedSignaturePromise && sessionId) {
+                        cachedSignaturePromise = getSessionSignature(env, sessionId);
+                      }
+                      const sig = part["thoughtSignature"] || part["thought_signature"] || (cachedSignaturePromise ? await cachedSignaturePromise : null) || "skip_thought_signature_validator";
                       await writer.write(encoder.encode(`data: ${JSON.stringify({
                         type: "content_block_start",
                         index: claudeTextIndex,
@@ -1253,7 +1278,6 @@ async function handleLogin(request, env) {
       await env.GEMINI_KV.put(`user:${username}`, JSON.stringify(user));
       await env.GEMINI_KV.put(`path:${user.api_config.custom_path}`, username);
       await env.GEMINI_KV.put(`key:${user.api_config.api_key}`, username);
-      console.log(`[DEBUG] Created user '${username}' with API Key: '${user.api_config.api_key}' and Custom Path: '/${user.api_config.custom_path}'`);
     } else if (user.password_hash !== pwdHash) {
       return new Response("\u7528\u6237\u540D\u6216\u5BC6\u7801\u9519\u8BEF", { status: 401 });
     }
@@ -1776,6 +1800,7 @@ async function handleApiProxy(request, env, ctx, customPath, apiType) {
   const projectId = tokens.project_id || "";
   let resolvedModel = physicalModel;
   let contents = [];
+  let contentsHaveFunctionCalls = false;
   let systemInstructionText = "";
   let toolsPayload = void 0;
   if (apiType === "openai") {
@@ -1789,7 +1814,7 @@ async function handleApiProxy(request, env, ctx, customPath, apiType) {
     const filteredMessages = body.messages.filter((m) => m.role !== "system" && m.role !== "developer");
     for (const fm of filteredMessages) {
       if (fm.content && typeof fm.content === "string") {
-        const t = fm.content.trim();
+        const t = trimForStructuralParse(fm.content);
         if (t.startsWith("[") && t.endsWith("]")) {
           try { const parsed = JSON.parse(t); if (Array.isArray(parsed)) fm.content = parsed; } catch (e) {}
         }
@@ -1806,24 +1831,20 @@ async function handleApiProxy(request, env, ctx, customPath, apiType) {
         }
       }
     }
-    const actualIncludeThinking = shouldEnableThinking(body, resolvedModel, apiType);
-    const cachedSig = await getSessionSignature(env, sessionId);
     contents = mergedMessages.map((m) => {
       const parts = [];
       if (m.reasoning_content && m.reasoning_content !== "[undefined]") {
         // Skip reasoning content in history to prevent signature validation errors
-      } else if (actualIncludeThinking && m.role === "assistant") {
-        // Skip thinking placeholder in history to prevent signature validation errors
       }
       if (m.content) {
         if (typeof m.content === "string") {
-          if (m.content.trim() !== "") {
+          if (hasNonWhitespace(m.content)) {
             parts.push({ text: m.content });
           }
         } else if (Array.isArray(m.content)) {
           for (const block of m.content) {
             if (block.type === "text") {
-              if (block.text && block.text.trim() !== "") {
+              if (block.text && hasNonWhitespace(block.text)) {
                 parts.push({ text: block.text });
               }
             } else if (block.type === "image_url" || block.type === "input_image") {
@@ -1846,6 +1867,7 @@ async function handleApiProxy(request, env, ctx, customPath, apiType) {
       }
       if (m.tool_calls && Array.isArray(m.tool_calls)) {
         for (const tc of m.tool_calls) {
+          contentsHaveFunctionCalls = true;
           let name = tc.function.name;
           if (name === "local_shell_call") name = "shell";
           let args = {};
@@ -1860,9 +1882,6 @@ async function handleApiProxy(request, env, ctx, customPath, apiType) {
               id: tc.id
             }
           };
-          if (actualIncludeThinking) {
-            // Skip attaching fake thought signatures to function calls to bypass Vertex Claude signature validation errors
-          }
           parts.push(funcPart);
         }
       }
@@ -1932,7 +1951,7 @@ async function handleApiProxy(request, env, ctx, customPath, apiType) {
     systemInstructionText = systemInstructions.filter(Boolean).join("\n\n");
     const rawClaude = (body.messages || []).map((m) => {
       if (m.content && typeof m.content === "string") {
-        const t = m.content.trim();
+        const t = trimForStructuralParse(m.content);
         if (t.startsWith("[") && t.endsWith("]")) {
           try { const parsed = JSON.parse(t); if (Array.isArray(parsed)) m.content = parsed; } catch (e) {}
         }
@@ -1950,8 +1969,6 @@ async function handleApiProxy(request, env, ctx, customPath, apiType) {
         }
       }
     }
-    const actualIncludeThinking = shouldEnableThinking(body, resolvedModel, apiType);
-    const cachedSig = await getSessionSignature(env, sessionId);
     const finalContents = [];
     for (const m of mergedMessages) {
       let blocks = [];
@@ -1977,7 +1994,7 @@ async function handleApiProxy(request, env, ctx, customPath, apiType) {
           } else if (block.type === "redacted_thinking") {
             // Skip redacted thinking blocks in history to bypass invalid thinking signature errors
           } else if (block.type === "text") {
-            if (block.text && block.text.trim() !== "") {
+            if (block.text && hasNonWhitespace(block.text)) {
               parts.push({ text: block.text });
             }
           } else if (block.type === "image" && block.source) {
@@ -1988,6 +2005,7 @@ async function handleApiProxy(request, env, ctx, customPath, apiType) {
               }
             });
           } else if (block.type === "tool_use") {
+            contentsHaveFunctionCalls = true;
             let name = block.name;
             if (name === "local_shell_call") name = "shell";
             const funcPart = {
@@ -2058,50 +2076,55 @@ async function handleApiProxy(request, env, ctx, customPath, apiType) {
     const isClaude = resolvedModel.toLowerCase().includes("claude");
     toolsPayload = mapTools(body, "claude", !isClaude, isClaude);
   } else {
-    contents = [];
-    if (body.contents && Array.isArray(body.contents)) {
-      const cachedSig = await getSessionSignature(env, sessionId);
-      const actualIncludeThinking = shouldEnableThinking(body, resolvedModel, apiType);
-      contents = body.contents.map((m) => {
-        if (!m.parts || !Array.isArray(m.parts)) return m;
-        const parts = m.parts.map((part) => {
-          if (part.functionCall) {
-            const funcPart = { ...part };
-            if (actualIncludeThinking) {
-              funcPart.thoughtSignature = part.thoughtSignature || part.thought_signature || cachedSig || "skip_thought_signature_validator";
-              funcPart.thought_signature = part.thoughtSignature || part.thought_signature || cachedSig || "skip_thought_signature_validator";
-            }
-            return funcPart;
-          }
-          return part;
-        });
-        return { ...m, parts };
-      });
-    }
-    if (body.systemInstruction?.parts?.[0]?.text) {
-      systemInstructionText = body.systemInstruction.parts[0].text;
-    }
-    if (body.tools && Array.isArray(body.tools)) {
-      const clonedTools = structuredClone(body.tools);
-      for (const t of clonedTools) {
-        if (t.functionDeclarations && Array.isArray(t.functionDeclarations)) {
-          for (const fd of t.functionDeclarations) {
-            if (fd.parameters) {
-              const defs = collectAllDefs(fd.parameters);
-              if (Object.keys(defs).length > 0) {
-                resolveRefs(fd.parameters, defs);
-                recursiveDeleteRefsAndDefs(fd.parameters);
+    if (mode === "codeassist") {
+      // CodeAssist forwards the original Gemini request object unchanged below.
+      // Avoid cloning large contents and schemas that would be discarded.
+      contents = body.contents || [];
+      toolsPayload = body.tools;
+    } else {
+      contents = [];
+      if (body.contents && Array.isArray(body.contents)) {
+        contentsHaveFunctionCalls = body.contents.some((m) => Array.isArray(m?.parts) && m.parts.some((part) => part?.functionCall));
+        if (contentsHaveFunctionCalls) {
+          const cachedSig = await getSessionSignature(env, sessionId);
+          const actualIncludeThinking = shouldEnableThinking(body, resolvedModel, apiType);
+          contents = body.contents.map((m) => {
+            if (!m.parts || !Array.isArray(m.parts)) return m;
+            const parts = m.parts.map((part) => {
+              if (part.functionCall) {
+                const funcPart = { ...part };
+                if (actualIncludeThinking) {
+                  funcPart.thoughtSignature = part.thoughtSignature || part.thought_signature || cachedSig || "skip_thought_signature_validator";
+                  funcPart.thought_signature = part.thoughtSignature || part.thought_signature || cachedSig || "skip_thought_signature_validator";
+                }
+                return funcPart;
               }
-              convertConstToEnum(fd.parameters);
-              cleanJsonSchema(fd.parameters, false);
-              uppercaseSchemaTypes(fd.parameters);
+              return part;
+            });
+            return { ...m, parts };
+          });
+        } else {
+          contents = body.contents;
+        }
+      }
+      if (body.systemInstruction?.parts?.[0]?.text) {
+        systemInstructionText = body.systemInstruction.parts[0].text;
+      }
+      if (body.tools && Array.isArray(body.tools)) {
+        const clonedTools = structuredClone(body.tools);
+        for (const t of clonedTools) {
+          if (t.functionDeclarations && Array.isArray(t.functionDeclarations)) {
+            for (const fd of t.functionDeclarations) {
+              if (fd.parameters) {
+                optimizeAndCleanSchema(fd.parameters, true);
+              }
             }
           }
         }
+        toolsPayload = clonedTools;
+      } else {
+        toolsPayload = body.tools;
       }
-      toolsPayload = clonedTools;
-    } else {
-      toolsPayload = body.tools;
     }
   }
   if (mode === "antigravity") {
@@ -2127,16 +2150,7 @@ async function handleApiProxy(request, env, ctx, customPath, apiType) {
         }
         if (body.response_format.type === "json_schema" && body.response_format.json_schema?.schema) {
           let schemaClone = structuredClone(body.response_format.json_schema.schema);
-          if (resolvedModel && resolvedModel.toLowerCase().includes("claude")) {
-            const defs = collectAllDefs(schemaClone);
-            if (Object.keys(defs).length > 0) {
-              resolveRefs(schemaClone, defs);
-              recursiveDeleteRefsAndDefs(schemaClone);
-            }
-            cleanJsonSchema(schemaClone, true);
-          } else {
-            cleanJsonSchema(schemaClone);
-          }
+          optimizeAndCleanSchema(schemaClone, false);
           genConfig.responseSchema = schemaClone;
         }
       }
@@ -2154,23 +2168,27 @@ async function handleApiProxy(request, env, ctx, customPath, apiType) {
       sessionId
     };
     if (contents && Array.isArray(contents)) {
-      const cachedSig = await getSessionSignature(env, sessionId);
-      const actualIncludeThinking = shouldEnableThinking(body, resolvedModel, apiType);
-      innerRequest.contents = contents.map((m) => {
-        if (!m.parts || !Array.isArray(m.parts)) return m;
-        const parts = m.parts.map((part) => {
-          if (part.functionCall) {
-            const funcPart = { ...part };
-            if (actualIncludeThinking) {
-              funcPart.thoughtSignature = part.thoughtSignature || part.thought_signature || cachedSig || "skip_thought_signature_validator";
-              funcPart.thought_signature = part.thoughtSignature || part.thought_signature || cachedSig || "skip_thought_signature_validator";
+      if (!contentsHaveFunctionCalls) {
+        innerRequest.contents = contents;
+      } else {
+        const cachedSig = await getSessionSignature(env, sessionId);
+        const actualIncludeThinking = shouldEnableThinking(body, resolvedModel, apiType);
+        innerRequest.contents = contents.map((m) => {
+          if (!m.parts || !Array.isArray(m.parts)) return m;
+          const parts = m.parts.map((part) => {
+            if (part.functionCall) {
+              const funcPart = { ...part };
+              if (actualIncludeThinking) {
+                funcPart.thoughtSignature = part.thoughtSignature || part.thought_signature || cachedSig || "skip_thought_signature_validator";
+                funcPart.thought_signature = part.thoughtSignature || part.thought_signature || cachedSig || "skip_thought_signature_validator";
+              }
+              return funcPart;
             }
-            return funcPart;
-          }
-          return part;
+            return part;
+          });
+          return { ...m, parts };
         });
-        return { ...m, parts };
-      });
+      }
     }
     const thinkingConfig = getUpstreamThinkingConfig(body, resolvedModel, apiType);
     if (thinkingConfig) {
@@ -2212,16 +2230,7 @@ async function handleApiProxy(request, env, ctx, customPath, apiType) {
         }
         if (body.response_format.type === "json_schema" && body.response_format.json_schema?.schema) {
           let schemaClone = structuredClone(body.response_format.json_schema.schema);
-          if (resolvedModel && resolvedModel.toLowerCase().includes("claude")) {
-            const defs = collectAllDefs(schemaClone);
-            if (Object.keys(defs).length > 0) {
-              resolveRefs(schemaClone, defs);
-              recursiveDeleteRefsAndDefs(schemaClone);
-            }
-            cleanJsonSchema(schemaClone, true);
-          } else {
-            cleanJsonSchema(schemaClone);
-          }
+          optimizeAndCleanSchema(schemaClone, false);
           genConfig.responseSchema = schemaClone;
         }
       }
