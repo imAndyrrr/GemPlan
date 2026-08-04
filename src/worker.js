@@ -1,4 +1,4 @@
-var __defProp = Object.defineProperty;
+﻿var __defProp = Object.defineProperty;
 var __name = (target, value) => __defProp(target, "name", { value, configurable: true });
 
 // src/worker.js
@@ -731,7 +731,8 @@ async function callUpstream(method, requestHeaders, payload, isStream) {
           shouldRetryWithoutHeader = true;
           break;
         }
-        const isRetryable = status === 429 || status === 408 || status === 404 || status >= 500;
+        // 400 (INVALID_ARGUMENT) 也会偶发出现于 Antigravity agent API，重试下一个 baseUrl
+        const isRetryable = status === 429 || status === 408 || status === 404 || status === 400 || status >= 500;
         if (hasNext && isRetryable) {
           if (response.body) {
             await response.body.cancel();
@@ -762,273 +763,346 @@ async function callUpstream(method, requestHeaders, payload, isStream) {
 }
 __name(callUpstream, "callUpstream");
 __name2(callUpstream, "callUpstream");
-async function processStream(readableStream, writableStream, apiType, modelName, env, sessionId, messageCount, ctx) {
+function isResponseEmpty(data) {
+  if (!data) return true;
+  const raw = data.response || data;
+  if (!raw || typeof raw !== "object") return true;
+  if (!Array.isArray(raw.candidates) || raw.candidates.length === 0) return true;
+  let hasAnyContent = false;
+  for (const candidate of raw.candidates) {
+    if (!candidate || typeof candidate !== "object") continue;
+    const parts = candidate.content?.parts;
+    if (Array.isArray(parts) && parts.length > 0) {
+      for (const part of parts) {
+        if (!part || typeof part !== "object") continue;
+        if (typeof part.text === "string" && /\S/u.test(part.text)) {
+          hasAnyContent = true;
+          break;
+        }
+        if (part.functionCall && typeof part.functionCall === "object") {
+          hasAnyContent = true;
+          break;
+        }
+        if (part.inlineData || part.fileData) {
+          hasAnyContent = true;
+          break;
+        }
+        if (part.thought === true && typeof part.text === "string" && /\S/u.test(part.text)) {
+          hasAnyContent = true;
+          break;
+        }
+      }
+    }
+    if (hasAnyContent) break;
+  }
+  return !hasAnyContent;
+}
+__name(isResponseEmpty, "isResponseEmpty");
+__name2(isResponseEmpty, "isResponseEmpty");
+async function readSseLines(readableStream) {
   const reader = readableStream.getReader();
-  const writer = writableStream.getWriter();
-  const encoder = new TextEncoder();
   const decoder = new TextDecoder();
   let buffer = "";
+  const lines = [];
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      let splitLines = buffer.split("\n");
+      buffer = splitLines.pop();
+      for (const line of splitLines) {
+        lines.push(line);
+      }
+    }
+    if (buffer.length > 0) {
+      lines.push(buffer);
+    }
+  } finally {
+    try {
+      reader.releaseLock();
+    } catch (_) {}
+  }
+  return lines;
+}
+__name(readSseLines, "readSseLines");
+__name2(readSseLines, "readSseLines");
+function isSseLinesEmpty(lines) {
+  if (!Array.isArray(lines) || lines.length === 0) return true;
+  let hasAnyContent = false;
+  for (const line of lines) {
+    if (!line.startsWith("data: ")) continue;
+    const dataStr = line.slice(6).trim();
+    if (dataStr === "[DONE]") continue;
+    try {
+      const chunk = JSON.parse(dataStr);
+      const responseBlock = chunk.response || chunk;
+      const candidates = responseBlock?.candidates;
+      if (Array.isArray(candidates) && candidates.length > 0) {
+        for (const candidate of candidates) {
+          const parts = candidate?.content?.parts;
+          if (Array.isArray(parts) && parts.length > 0) {
+            for (const part of parts) {
+              if (!part || typeof part !== "object") continue;
+              if (typeof part.text === "string" && /\S/u.test(part.text)) {
+                hasAnyContent = true;
+                break;
+              }
+              if (part.functionCall && typeof part.functionCall === "object") {
+                hasAnyContent = true;
+                break;
+              }
+              if (part.inlineData || part.fileData) {
+                hasAnyContent = true;
+                break;
+              }
+              if (part.thought === true && typeof part.text === "string" && /\S/u.test(part.text)) {
+                hasAnyContent = true;
+                break;
+              }
+            }
+          }
+          if (hasAnyContent) break;
+        }
+      }
+    } catch (e) {}
+    if (hasAnyContent) break;
+  }
+  return !hasAnyContent;
+}
+__name(isSseLinesEmpty, "isSseLinesEmpty");
+__name2(isSseLinesEmpty, "isSseLinesEmpty");
+async function processStreamLines(lines, writableStream, apiType, modelName, env, sessionId, messageCount, ctx) {
+  const writer = writableStream.getWriter();
+  const encoder = new TextEncoder();
   let claudeStarted = false;
   let claudeTextIndex = 0;
   let currentBlockType = null;
   let lastQueuedSignature = null;
   let cachedSignaturePromise = null;
   try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-      let lines = buffer.split("\n");
-      buffer = lines.pop();
-      for (const line of lines) {
-        if (!line.startsWith("data: ")) continue;
-        const dataStr = line.slice(6).trim();
-        if (dataStr === "[DONE]") continue;
-        try {
-          const chunk = JSON.parse(dataStr);
-          const responseBlock = chunk.response || chunk;
-          const candidate = responseBlock?.candidates?.[0];
-          if (!candidate) continue;
-          const parts = candidate.content?.parts;
-          if (Array.isArray(parts) && sessionId && env && ctx) {
-            for (const part of parts) {
-              const sig = part["thoughtSignature"] || part["thought_signature"];
-              if (sig && sig.length >= 50 && sig !== lastQueuedSignature) {
-                lastQueuedSignature = sig;
-                ctx.waitUntil(cacheSessionSignature(env, sessionId, sig, messageCount));
+    for (const line of lines) {
+      if (!line.startsWith("data: ")) continue;
+      const dataStr = line.slice(6).trim();
+      if (dataStr === "[DONE]") continue;
+      try {
+        const chunk = JSON.parse(dataStr);
+        const responseBlock = chunk.response || chunk;
+        const candidate = responseBlock?.candidates?.[0];
+        if (!candidate) continue;
+        const parts = candidate.content?.parts;
+        if (Array.isArray(parts) && sessionId && env && ctx) {
+          for (const part of parts) {
+            const sig = part["thoughtSignature"] || part["thought_signature"];
+            if (sig && sig.length >= 50 && sig !== lastQueuedSignature) {
+              lastQueuedSignature = sig;
+              ctx.waitUntil(cacheSessionSignature(env, sessionId, sig, messageCount));
+            }
+          }
+        }
+        if (apiType === "openai") {
+          if (Array.isArray(parts)) {
+            const hasExplicitThought = parts.some((p) => p["thought"] === true);
+            for (let pIdx = 0; pIdx < parts.length; pIdx++) {
+              const part = parts[pIdx];
+              const isThought = part["thought"] === true || (!hasExplicitThought && pIdx === 0 && parts.length >= 2);
+              if (part.text) {
+                const oaiChunk = {
+                  id: "chatcmpl-" + generateRandomString(12),
+                  object: "chat.completion.chunk",
+                  created: Math.floor(Date.now() / 1e3),
+                  model: modelName,
+                  choices: [{
+                    index: 0,
+                    delta: isThought ? { reasoning_content: part.text } : { content: part.text }
+                  }]
+                };
+                await writer.write(encoder.encode(`data: ${JSON.stringify(oaiChunk)}\n\n`));
+              }
+              if (part.functionCall) {
+                const fc = part.functionCall;
+                const name = fc.name || "unknown";
+                const id = fc.id || `call_${name}_${generateRandomString(8)}`;
+                const oaiChunk = {
+                  id: "chatcmpl-" + generateRandomString(12),
+                  object: "chat.completion.chunk",
+                  created: Math.floor(Date.now() / 1e3),
+                  model: modelName,
+                  choices: [{
+                    index: 0,
+                    delta: {
+                      tool_calls: [{
+                        index: 0,
+                        id,
+                        type: "function",
+                        function: {
+                          name,
+                          arguments: typeof fc.args === "object" ? JSON.stringify(fc.args) : fc.args || "{}"
+                        }
+                      }]
+                    }
+                  }]
+                };
+                await writer.write(encoder.encode(`data: ${JSON.stringify(oaiChunk)}\n\n`));
               }
             }
           }
-          if (apiType === "gemini") {
-            await writer.write(encoder.encode(`data: ${JSON.stringify(chunk)}
-
-`));
-          } else if (apiType === "openai") {
-            if (Array.isArray(parts)) {
-              for (const part of parts) {
-                const isThought = part["thought"] === true;
-                if (part.text) {
-                  const oaiChunk = {
-                    id: "chatcmpl-" + generateRandomString(12),
-                    object: "chat.completion.chunk",
-                    created: Math.floor(Date.now() / 1e3),
-                    model: modelName,
-                    choices: [{
-                      index: 0,
-                      delta: isThought ? { reasoning_content: part.text } : { content: part.text }
-                    }]
-                  };
-                  await writer.write(encoder.encode(`data: ${JSON.stringify(oaiChunk)}
-
-`));
-                }
-                if (part.functionCall) {
-                  const fc = part.functionCall;
-                  const name = fc.name || "unknown";
-                  const id = fc.id || `call_${name}_${generateRandomString(8)}`;
-                  const oaiChunk = {
-                    id: "chatcmpl-" + generateRandomString(12),
-                    object: "chat.completion.chunk",
-                    created: Math.floor(Date.now() / 1e3),
-                    model: modelName,
-                    choices: [{
-                      index: 0,
-                      delta: {
-                        tool_calls: [{
-                          id,
-                          type: "function",
-                          function: {
-                            name,
-                            arguments: typeof fc.args === "object" ? JSON.stringify(fc.args) : fc.args || "{}"
-                          }
-                        }]
-                      }
-                    }]
-                  };
-                  await writer.write(encoder.encode(`data: ${JSON.stringify(oaiChunk)}
-
-`));
-                }
-              }
+          if (candidate.finishReason) {
+            let oaiFinishReason = "stop";
+            const upperReason = candidate.finishReason.toUpperCase();
+            if (upperReason === "MAX_TOKENS") {
+              oaiFinishReason = "length";
+            } else if (upperReason === "SAFETY" || upperReason === "RECITATION") {
+              oaiFinishReason = "content_filter";
             }
-            if (candidate.finishReason) {
-              let oaiFinishReason = "stop";
-              const upperReason = candidate.finishReason.toUpperCase();
-              if (upperReason === "MAX_TOKENS") {
-                oaiFinishReason = "length";
-              } else if (upperReason === "SAFETY" || upperReason === "RECITATION") {
-                oaiFinishReason = "content_filter";
-              } else if (upperReason === "OTHER" || upperReason === "FINISH_REASON_UNSPECIFIED") {
-                oaiFinishReason = "other";
-              } else if (upperReason === "STOP") {
-                oaiFinishReason = "stop";
-              }
-              const oaiChunk = {
-                id: "chatcmpl-" + generateRandomString(12),
-                object: "chat.completion.chunk",
-                created: Math.floor(Date.now() / 1e3),
+            const finishChunk = {
+              id: "chatcmpl-" + generateRandomString(12),
+              object: "chat.completion.chunk",
+              created: Math.floor(Date.now() / 1e3),
+              model: modelName,
+              choices: [{
+                index: 0,
+                delta: {},
+                finish_reason: oaiFinishReason
+              }]
+            };
+            await writer.write(encoder.encode(`data: ${JSON.stringify(finishChunk)}\n\n`));
+          }
+        } else if (apiType === "claude") {
+          if (!claudeStarted) {
+            const startEvent = {
+              type: "message_start",
+              message: {
+                id: "msg_" + generateRandomString(24),
+                type: "message",
+                role: "assistant",
                 model: modelName,
-                choices: [{
-                  index: 0,
-                  delta: {},
-                  finish_reason: oaiFinishReason
-                }]
-              };
-              await writer.write(encoder.encode(`data: ${JSON.stringify(oaiChunk)}
-
-`));
-            }
-          } else if (apiType === "claude") {
-            if (!claudeStarted) {
-              await writer.write(encoder.encode(`data: ${JSON.stringify({
-                type: "message_start",
-                message: {
-                  id: "msg_" + generateRandomString(24),
-                  type: "message",
-                  role: "assistant",
-                  model: modelName,
-                  content: [],
-                  stop_reason: null,
-                  stop_sequence: null,
-                  usage: { input_tokens: 0, output_tokens: 0 }
-                }
-              })}
-
-`));
-              claudeStarted = true;
-            }
-            if (Array.isArray(parts)) {
-              for (const part of parts) {
-                if (part.text) {
-                  const isThought = part["thought"] === true;
-                  if (isThought) {
-                    if (currentBlockType !== "thinking") {
-                      if (currentBlockType !== null) {
-                        await writer.write(encoder.encode(`data: ${JSON.stringify({
-                          type: "content_block_stop",
-                          index: claudeTextIndex
-                        })}
-
-`));
-                        claudeTextIndex++;
-                      }
-                      if (!cachedSignaturePromise && sessionId) {
-                        cachedSignaturePromise = getSessionSignature(env, sessionId);
-                      }
-                      const sig = part["thoughtSignature"] || part["thought_signature"] || (cachedSignaturePromise ? await cachedSignaturePromise : null) || "skip_thought_signature_validator";
-                      await writer.write(encoder.encode(`data: ${JSON.stringify({
-                        type: "content_block_start",
-                        index: claudeTextIndex,
-                        content_block: { type: "thinking", thinking: "", signature: sig }
-                      })}
-
-`));
-                      currentBlockType = "thinking";
-                    }
-                    await writer.write(encoder.encode(`data: ${JSON.stringify({
-                      type: "content_block_delta",
-                      index: claudeTextIndex,
-                      delta: { type: "thinking_delta", thinking: part.text }
-                    })}
-
-`));
-                  } else {
-                    if (currentBlockType !== "text") {
-                      if (currentBlockType !== null) {
-                        await writer.write(encoder.encode(`data: ${JSON.stringify({
-                          type: "content_block_stop",
-                          index: claudeTextIndex
-                        })}
-
-`));
-                        claudeTextIndex++;
-                      }
-                      await writer.write(encoder.encode(`data: ${JSON.stringify({
-                        type: "content_block_start",
-                        index: claudeTextIndex,
-                        content_block: { type: "text", text: "" }
-                      })}
-
-`));
-                      currentBlockType = "text";
-                    }
-                    await writer.write(encoder.encode(`data: ${JSON.stringify({
-                      type: "content_block_delta",
-                      index: claudeTextIndex,
-                      delta: { type: "text_delta", text: part.text }
-                    })}
-
-`));
-                  }
-                }
-                if (part.functionCall) {
+                content: [],
+                stop_reason: null,
+                stop_sequence: null,
+                usage: { input_tokens: 0, output_tokens: 0 }
+              }
+            };
+            await writer.write(encoder.encode(`event: message_start\ndata: ${JSON.stringify(startEvent)}\n\n`));
+            claudeStarted = true;
+          }
+          if (Array.isArray(parts)) {
+            const hasExplicitThought = parts.some((p) => p["thought"] === true);
+            for (let pIdx = 0; pIdx < parts.length; pIdx++) {
+              const part = parts[pIdx];
+              const isThought = part["thought"] === true || (!hasExplicitThought && pIdx === 0 && parts.length >= 2);
+              if (isThought && part.text) {
+                if (currentBlockType !== "thinking") {
                   if (currentBlockType !== null) {
-                    await writer.write(encoder.encode(`data: ${JSON.stringify({
-                      type: "content_block_stop",
-                      index: claudeTextIndex
-                    })}
-
-`));
+                    await writer.write(encoder.encode(`event: content_block_stop\ndata: ${JSON.stringify({ type: "content_block_stop", index: claudeTextIndex })}\n\n`));
                     claudeTextIndex++;
-                    currentBlockType = null;
                   }
-                  const fc = part.functionCall;
-                  const name = fc.name || "unknown";
-                  const id = fc.id || `toolu_${generateRandomString(12)}`;
-                  await writer.write(encoder.encode(`data: ${JSON.stringify({
+                  let signatureToUse = part["thoughtSignature"] || part["thought_signature"];
+                  if (!signatureToUse && sessionId && env) {
+                    if (!cachedSignaturePromise) {
+                      cachedSignaturePromise = getSessionSignature(env, sessionId);
+                    }
+                    signatureToUse = await cachedSignaturePromise;
+                  }
+                  if (!signatureToUse) {
+                    signatureToUse = "skip_thought_signature_validator";
+                  }
+                  const blockStart = {
                     type: "content_block_start",
                     index: claudeTextIndex,
-                    content_block: {
-                      type: "tool_use",
-                      id,
-                      name,
-                      input: typeof fc.args === "object" ? fc.args : JSON.parse(fc.args || "{}")
-                    }
-                  })}
-
-`));
-                  await writer.write(encoder.encode(`data: ${JSON.stringify({
-                    type: "content_block_stop",
-                    index: claudeTextIndex
-                  })}
-
-`));
-                  claudeTextIndex++;
+                    content_block: { type: "thinking", thinking: "", signature: signatureToUse }
+                  };
+                  await writer.write(encoder.encode(`event: content_block_start\ndata: ${JSON.stringify(blockStart)}\n\n`));
+                  currentBlockType = "thinking";
                 }
+                const deltaEvent = {
+                  type: "content_block_delta",
+                  index: claudeTextIndex,
+                  delta: { type: "thinking_delta", thinking: part.text }
+                };
+                await writer.write(encoder.encode(`event: content_block_delta\ndata: ${JSON.stringify(deltaEvent)}\n\n`));
+              } else if (!isThought && part.text) {
+                if (currentBlockType !== "text") {
+                  if (currentBlockType !== null) {
+                    await writer.write(encoder.encode(`event: content_block_stop\ndata: ${JSON.stringify({ type: "content_block_stop", index: claudeTextIndex })}\n\n`));
+                    claudeTextIndex++;
+                  }
+                  const blockStart = {
+                    type: "content_block_start",
+                    index: claudeTextIndex,
+                    content_block: { type: "text", text: "" }
+                  };
+                  await writer.write(encoder.encode(`event: content_block_start\ndata: ${JSON.stringify(blockStart)}\n\n`));
+                  currentBlockType = "text";
+                }
+                const deltaEvent = {
+                  type: "content_block_delta",
+                  index: claudeTextIndex,
+                  delta: { type: "text_delta", text: part.text }
+                };
+                await writer.write(encoder.encode(`event: content_block_delta\ndata: ${JSON.stringify(deltaEvent)}\n\n`));
+              }
+              if (part.functionCall) {
+                if (currentBlockType !== null) {
+                  await writer.write(encoder.encode(`event: content_block_stop\ndata: ${JSON.stringify({ type: "content_block_stop", index: claudeTextIndex })}\n\n`));
+                  claudeTextIndex++;
+                  currentBlockType = null;
+                }
+                const fc = part.functionCall;
+                const name = fc.name || "unknown";
+                const id = fc.id || `toolu_${generateRandomString(12)}`;
+                const toolBlockStart = {
+                  type: "content_block_start",
+                  index: claudeTextIndex,
+                  content_block: { type: "tool_use", id, name, input: {} }
+                };
+                await writer.write(encoder.encode(`event: content_block_start\ndata: ${JSON.stringify(toolBlockStart)}\n\n`));
+                const argsStr = typeof fc.args === "object" ? JSON.stringify(fc.args) : fc.args || "{}";
+                const toolDelta = {
+                  type: "content_block_delta",
+                  index: claudeTextIndex,
+                  delta: { type: "input_json_delta", partial_json: argsStr }
+                };
+                await writer.write(encoder.encode(`event: content_block_delta\ndata: ${JSON.stringify(toolDelta)}\n\n`));
+                await writer.write(encoder.encode(`event: content_block_stop\ndata: ${JSON.stringify({ type: "content_block_stop", index: claudeTextIndex })}\n\n`));
+                claudeTextIndex++;
               }
             }
           }
-        } catch (e) {
+          if (candidate.finishReason) {
+            if (currentBlockType !== null) {
+              await writer.write(encoder.encode(`event: content_block_stop\ndata: ${JSON.stringify({ type: "content_block_stop", index: claudeTextIndex })}\n\n`));
+              currentBlockType = null;
+            }
+            const msgDelta = {
+              type: "message_delta",
+              delta: { stop_reason: "end_turn", stop_sequence: null },
+              usage: { output_tokens: 0 }
+            };
+            await writer.write(encoder.encode(`event: message_delta\ndata: ${JSON.stringify(msgDelta)}\n\n`));
+            await writer.write(encoder.encode(`event: message_stop\ndata: ${JSON.stringify({ type: "message_stop" })}\n\n`));
+          }
+        } else {
+          await writer.write(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
         }
+      } catch (e) {
       }
     }
     if (apiType === "openai") {
       await writer.write(encoder.encode("data: [DONE]\n\n"));
-    } else if (apiType === "claude") {
-      if (currentBlockType !== null) {
-        await writer.write(encoder.encode(`data: ${JSON.stringify({
-          type: "content_block_stop",
-          index: claudeTextIndex
-        })}
-
-`));
-      }
-      await writer.write(encoder.encode(`data: ${JSON.stringify({
-        type: "message_delta",
-        delta: { stop_reason: "end_turn", stop_sequence: null },
-        usage: { output_tokens: 0 }
-      })}
-
-`));
-      await writer.write(encoder.encode(`data: ${JSON.stringify({
-        type: "message_stop"
-      })}
-
-`));
     }
   } finally {
-    await writer.close();
+    try {
+      await writer.close();
+    } catch (_) {
+    }
   }
+}
+__name(processStreamLines, "processStreamLines");
+__name2(processStreamLines, "processStreamLines");
+async function processStream(readableStream, writableStream, apiType, modelName, env, sessionId, messageCount, ctx) {
+  const lines = await readSseLines(readableStream);
+  return processStreamLines(lines, writableStream, apiType, modelName, env, sessionId, messageCount, ctx);
 }
 __name(processStream, "processStream");
 __name2(processStream, "processStream");
@@ -2269,23 +2343,85 @@ async function handleApiProxy(request, env, ctx, customPath, apiType) {
   // Antigravity + Gemini 模型支持 streamGenerateContent，用真流式以节省内存
   const useStreamUpstream = isStream && (mode === "codeassist" || !isClaudeModel);
   const method = useStreamUpstream ? "streamGenerateContent" : "generateContent";
-  let googleRes;
-  try {
-    googleRes = await callUpstream(method, requestHeaders, cloudCodePayload, useStreamUpstream);
-  } catch (err) {
-    return jsonResponse({ error: err.message || err }, 500);
-  }
-  if (!googleRes.ok) {
-    const errorText = await googleRes.text();
-    return new Response(errorText, {
-      status: googleRes.status,
-      headers: {
-        "Content-Type": googleRes.headers.get("Content-Type") || "text/plain;charset=utf-8",
-        "Access-Control-Allow-Origin": "*",
-        "Access-Control-Allow-Headers": "*",
-        "Access-Control-Allow-Methods": "*"
+  let googleRes = null;
+  let responseData = null;
+  let sseLines = null;
+  const MAX_RETRIES = 3;
+  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+    try {
+      googleRes = await callUpstream(method, requestHeaders, cloudCodePayload, useStreamUpstream);
+    } catch (err) {
+      if (attempt === MAX_RETRIES) {
+        return jsonResponse({ error: err.message || String(err) }, 500);
       }
-    });
+      await new Promise((r) => setTimeout(r, 200 * attempt));
+      continue;
+    }
+    if (!googleRes.ok) {
+      const status = googleRes.status;
+      // Antigravity agent API 偶发返回 400 INVALID_ARGUMENT（同一请求重试即可成功），
+      // 对 4xx/5xx 做有限重试，避免偶发故障直接透传。
+      const retryableStatus = status === 400 || status === 429 || status === 408 || status === 500 || status === 502 || status === 503 || status === 504;
+      if (retryableStatus && attempt < MAX_RETRIES) {
+        try {
+          await googleRes.body?.cancel();
+        } catch (e) {
+        }
+        await new Promise((r) => setTimeout(r, 250 * attempt));
+        continue;
+      }
+      const errorText = await googleRes.text();
+      return new Response(errorText, {
+        status,
+        headers: {
+          "Content-Type": googleRes.headers.get("Content-Type") || "text/plain;charset=utf-8",
+          "Access-Control-Allow-Origin": "*",
+          "Access-Control-Allow-Headers": "*",
+          "Access-Control-Allow-Methods": "*"
+        }
+      });
+    }
+    if (useStreamUpstream) {
+      sseLines = await readSseLines(googleRes.body);
+      if (isSseLinesEmpty(sseLines)) {
+        console.warn(`Upstream returned empty SSE stream (attempt ${attempt}/${MAX_RETRIES})`);
+        if (attempt === MAX_RETRIES) {
+          return jsonResponse({
+            error: {
+              message: "Model returned an empty response after 3 attempts",
+              type: "api_error"
+            }
+          }, 500);
+        }
+        await new Promise((r) => setTimeout(r, 200 * attempt));
+        continue;
+      }
+      break;
+    } else {
+      try {
+        responseData = await googleRes.json();
+      } catch (e) {
+        if (attempt === MAX_RETRIES) {
+          return jsonResponse({ error: "Failed to parse upstream JSON response" }, 500);
+        }
+        await new Promise((r) => setTimeout(r, 200 * attempt));
+        continue;
+      }
+      if (isResponseEmpty(responseData)) {
+        console.warn(`Upstream returned empty response (attempt ${attempt}/${MAX_RETRIES})`);
+        if (attempt === MAX_RETRIES) {
+          return jsonResponse({
+            error: {
+              message: "Model returned an empty response after 3 attempts",
+              type: "api_error"
+            }
+          }, 500);
+        }
+        await new Promise((r) => setTimeout(r, 200 * attempt));
+        continue;
+      }
+      break;
+    }
   }
   if (isStream) {
     const { readable, writable } = new TransformStream();
@@ -2295,8 +2431,7 @@ async function handleApiProxy(request, env, ctx, customPath, apiType) {
       const encoder = new TextEncoder();
       ctx.waitUntil((async () => {
         try {
-          const data = await googleRes.json();
-          await streamSimulatedResponse(data, apiType, inputModel, writer, encoder, env, sessionId, messageCount, ctx);
+          await streamSimulatedResponse(responseData, apiType, inputModel, writer, encoder, env, sessionId, messageCount, ctx);
         } catch (e) {
           try {
             await writer.close();
@@ -2308,7 +2443,7 @@ async function handleApiProxy(request, env, ctx, customPath, apiType) {
       // codeassist 或 antigravity+Gemini：真 SSE 流式
       ctx.waitUntil((async () => {
         try {
-          await processStream(googleRes.body, writable, apiType, inputModel, env, sessionId, messageCount, ctx);
+          await processStreamLines(sseLines, writable, apiType, inputModel, env, sessionId, messageCount, ctx);
         } catch (e) {
           try {
             const w = writable.getWriter();
@@ -2328,7 +2463,7 @@ async function handleApiProxy(request, env, ctx, customPath, apiType) {
       }
     });
   } else {
-    const data = await googleRes.json();
+    const data = responseData;
     if (sessionId) {
       let responseSig = null;
       const raw = data.response || data;
