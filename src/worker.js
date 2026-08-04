@@ -252,6 +252,31 @@ function optimizeAndCleanSchema(schema, needsUppercase, defs = null, depth = 0, 
     } else {
       const firstValid = schema.anyOf.find((x) => x && typeof x === "object");
       if (firstValid) {
+        // 选中分支若是 $ref，先解析为实际定义，避免残留悬空 $ref。
+        // （agent API 不接受 $ref；Claude 侧 $defs 已被删除，引用会失效。）
+        if (firstValid.$ref && typeof firstValid.$ref === "string" && defs) {
+          let refName = null;
+          if (firstValid.$ref.startsWith("#/$defs/")) refName = firstValid.$ref.slice(8);
+          else if (firstValid.$ref.startsWith("#/definitions/")) refName = firstValid.$ref.slice(14);
+          if (refName && defs[refName]) {
+            if (seenRefs.has(refName)) {
+              delete firstValid.$ref;
+              firstValid.type = "object";
+              firstValid.description = firstValid.description || `Bypassed circular reference to ${refName}`;
+            } else {
+              const resolvedRef = structuredClone(defs[refName]);
+              const extraRef = {};
+              for (const k of Object.keys(firstValid)) {
+                if (k !== "$ref") extraRef[k] = firstValid[k];
+              }
+              for (const k of Object.keys(firstValid)) delete firstValid[k];
+              Object.assign(firstValid, resolvedRef, extraRef);
+              seenRefs.add(refName);
+              optimizeAndCleanSchema(firstValid, needsUppercase, defs, depth + 1, seenRefs);
+              seenRefs.delete(refName);
+            }
+          }
+        }
         const resolved = structuredClone(firstValid);
         const extra = {};
         for (const k of Object.keys(schema)) {
@@ -375,6 +400,12 @@ function mergeOpenAIMessages(messages) {
   const merged = [];
   for (const msg of messages) {
     const role = msg.role === "assistant" ? "assistant" : msg.role === "system" || msg.role === "developer" ? "system" : "user";
+    if (msg.role === "tool") {
+      // 工具结果消息保持独立，不参与合并：
+      // 合并会丢失各自的 tool_call_id，导致 Claude 的 tool_use→tool_result 无法一一配对。
+      merged.push({ ...msg, role: "tool" });
+      continue;
+    }
     if (merged.length > 0 && merged[merged.length - 1].role === role) {
       const prev = merged[merged.length - 1];
       if (msg.content) {
@@ -673,7 +704,16 @@ function mapTools(body, apiType, needsUppercase = true, preserveDraft2020 = fals
           description: t.function.description || "",
           parameters: t.function.parameters ? structuredClone(t.function.parameters) : {}
         };
-        optimizeAndCleanSchema(fd.parameters, needsUppercase);
+        // Claude 模型经 agent API 转发时，工具 schema 同时要满足
+        // Google agent API（内联 $ref/$defs、无 $defs）和 Claude（draft 2020-12 小写类型）。
+        // 因此 Claude 模型仍执行 optimizeAndCleanSchema 来内联引用，但 needsUppercase=false
+        // 保留小写类型，避免 "JSON schema is invalid. It must match JSON Schema draft 2020-12" 400。
+        // 仅影响 openai 分支的 Claude 模型；claude 分支（Claude Code）保持不变。
+        if (preserveDraft2020) {
+          optimizeAndCleanSchema(fd.parameters, false);
+        } else {
+          optimizeAndCleanSchema(fd.parameters, needsUppercase);
+        }
         functionDeclarations.push(fd);
       }
     }
@@ -1873,6 +1913,7 @@ async function handleApiProxy(request, env, ctx, customPath, apiType) {
   };
   const projectId = tokens.project_id || "";
   let resolvedModel = physicalModel;
+  const isClaudeModel = resolvedModel.toLowerCase().includes("claude");
   let contents = [];
   let contentsHaveFunctionCalls = false;
   let systemInstructionText = "";
@@ -1907,10 +1948,14 @@ async function handleApiProxy(request, env, ctx, customPath, apiType) {
     }
     contents = mergedMessages.map((m) => {
       const parts = [];
+      // 工具结果消息：Claude 模型需要 tool_use→tool_result 配对，必须生成 functionResponse。
+      // Gemini 保持原行为（工具输出作为纯文本，不生成 functionResponse，避免触发
+      // agent API 对 functionCall 的 thought_signature 校验）。
+      const isToolResult = isClaudeModel && (m.role === "tool" || !!m.tool_call_id);
       if (m.reasoning_content && m.reasoning_content !== "[undefined]") {
         // Skip reasoning content in history to prevent signature validation errors
       }
-      if (m.content) {
+      if (m.content && !isToolResult) {
         if (typeof m.content === "string") {
           if (hasNonWhitespace(m.content)) {
             parts.push({ text: m.content });
@@ -1959,7 +2004,7 @@ async function handleApiProxy(request, env, ctx, customPath, apiType) {
           parts.push(funcPart);
         }
       }
-      if (m.role === "tool") {
+      if (isToolResult) {
         const name = m.name || toolIdToName[m.tool_call_id] || "unknown";
         const finalName = m.tool_call_id ? toolIdToName[m.tool_call_id] || name : name;
         if (Array.isArray(m.content)) {
@@ -2007,7 +2052,6 @@ async function handleApiProxy(request, env, ctx, customPath, apiType) {
         parts
       };
     }).filter((c) => c.parts.length > 0);
-    const isClaudeModel = resolvedModel.toLowerCase().includes("claude");
     toolsPayload = mapTools(body, "openai", true, isClaudeModel);
   } else if (apiType === "claude") {
     const systemInstructions = [];
@@ -2338,7 +2382,6 @@ async function handleApiProxy(request, env, ctx, customPath, apiType) {
       request: innerRequest
     };
   }
-  const isClaudeModel = resolvedModel.toLowerCase().includes("claude");
   // Antigravity + Claude 模型不支持 SSE 流式接口，必须用非流式再模拟
   // Antigravity + Gemini 模型支持 streamGenerateContent，用真流式以节省内存
   const useStreamUpstream = isStream && (mode === "codeassist" || !isClaudeModel);
