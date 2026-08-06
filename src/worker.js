@@ -1736,7 +1736,7 @@ async function handleDashboard(request, env) {
               html +=
                 '<div style="display:flex;justify-content:space-between;align-items:center;font-size:13px;margin-top:8px;">' +
                   '<span style="font-family:monospace;word-break:break-all;">' + agEscHtml(label) +
-                    (m.thinking_budget != null ? ' <span style="font-size:10px;color:#6c757d;">(\u9884\u7B97 ' + agEscHtml(m.thinking_budget) + ')</span>' : '') +
+                    (m.thinking_budget != null ? ' <span style="font-size:10px;color:#6c757d;">(\u601D\u8003\u9884\u7B97 ' + agEscHtml(m.thinking_budget) + ')</span>' : '') +
                   '</span>' + agPctBadge(p) +
                 '</div>' + agProgress(p) +
                 '<div style="font-size:11px;color:#6c757d;margin-top:2px;word-break:break-all;">\u91CD\u7F6E: ' + agEscHtml(agFmtReset(m.reset_time)) + ' \u00B7 ' + agEscHtml(m.name) + '</div>';
