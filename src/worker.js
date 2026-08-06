@@ -2429,8 +2429,8 @@ async function handleApiProxy(request, env, ctx, customPath, apiType) {
         if (Array.isArray(m.content)) {
           const textParts = [];
           for (const blk of m.content) {
-            if (blk.type === "text" && blk.text) {
-              textParts.push(blk.text);
+            if ((blk.type === "text" || blk.type === "input_text") && blk.text) {
+              textParts.push(typeof blk.text === "string" ? blk.text : JSON.stringify(blk.text));
             } else if (blk.type === "image_url" || blk.type === "input_image") {
               const imgUrl = typeof blk.image_url === "string" ? blk.image_url : blk.image_url?.url;
               if (imgUrl) {
@@ -2447,15 +2447,16 @@ async function handleApiProxy(request, env, ctx, customPath, apiType) {
               }
             }
           }
-          if (textParts.length > 0) {
-            parts.push({
-              functionResponse: {
-                name: finalName,
-                response: { result: textParts.join("\n") },
-                id: m.tool_call_id || ""
-              }
-            });
-          }
+          // 无论 tool result 里是否只有图片/无文本，都必须生成 functionResponse，
+          // 否则该 tool_use 没有紧邻的 tool_result，Anthropic 会报
+          // "tool_use ids were found without tool_result blocks immediately after"。
+          parts.push({
+            functionResponse: {
+              name: finalName,
+              response: { result: textParts.join("\n") },
+              id: m.tool_call_id || ""
+            }
+          });
         } else {
           parts.push({
             functionResponse: {
@@ -2560,8 +2561,8 @@ async function handleApiProxy(request, env, ctx, customPath, apiType) {
               resultText = block.content;
             } else if (Array.isArray(block.content)) {
               for (const rb of block.content) {
-                if (rb.type === "text" && rb.text) {
-                  resultText += (resultText ? "\n" : "") + rb.text;
+                if ((rb.type === "text" || rb.type === "input_text" || rb.type === "output_text") && rb.text) {
+                  resultText += (resultText ? "\n" : "") + (typeof rb.text === "string" ? rb.text : JSON.stringify(rb.text));
                 } else if (rb.type === "image" && rb.source) {
                   parts.push({ inlineData: { mimeType: rb.source.media_type || "image/jpeg", data: rb.source.data || "" } });
                 } else if (rb.type === "image_url" || rb.type === "input_image") {
