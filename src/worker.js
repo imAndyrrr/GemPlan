@@ -1460,6 +1460,14 @@ async function handleDashboard(request, env) {
     </div>
 
     <div class="card">
+      <h3 style="color:#28a745;">Antigravity \u6A21\u5F0F\u914D\u989D\u67E5\u770B</h3>
+      <p style="font-size:12px;color:#666;">\u4EFF\u7167 Antigravity-Manager \u5B9E\u73B0\uFF0C\u5C55\u793A\u5F53\u524D\u7ED1\u5B9A\u8D26\u53F7\u7684\u6A21\u578B\u914D\u989D\u4E0E\u5206\u7EC4\u914D\u989D\uFF085 \u5C0F\u65F6 / \u6BCF\u5468\u7A97\u53E3\uFF09\u3002\u6570\u636E\u5728\u670D\u52A1\u7AEF\u7F13\u5B58 60 \u79D2\uFF0C\u70B9\u51FB\u300C\u5237\u65B0\u914D\u989D\u300D\u5F3A\u5236\u62C9\u53D6\u6700\u65B0\u6570\u636E\u3002</p>
+      <div id="ag-quota-status" style="margin-bottom:10px;font-size:13px;">${user.antigravity_tokens ? '\u5C1A\u672A\u52A0\u8F7D' : '<span style="color:red;">\u26A0\uFE0F \u672A\u7ED1\u5B9A Antigravity \u8D26\u53F7\uFF0C\u8BF7\u5148\u5728\u7B2C\u4E8C\u90E8\u5206\u5B8C\u6210\u6388\u6743</span>'}</div>
+      <button id="ag-quota-refresh-btn" onclick="loadAntigravityQuota(true)" ${user.antigravity_tokens ? '' : 'disabled'} style="width:auto;background:#28a745;">\u5237\u65B0\u914D\u989D</button>
+      <div id="ag-quota-content" style="margin-top:15px;"></div>
+    </div>
+
+    <div class="card">
       <h3>\u7B2C\u4E09\u90E8\u5206\uFF1AAPI \u7AEF\u70B9\u4E0E\u6A21\u5F0F\u8BBE\u7F6E</h3>
       <form action="/api/user/update" method="POST">
         <input type="hidden" name="action" value="api_config">
@@ -1649,6 +1657,124 @@ async function handleDashboard(request, env) {
           messagesDiv.scrollTop = messagesDiv.scrollHeight;
         }
       }
+
+      let agQuotaHasAntigravity = ${user.antigravity_tokens ? "true" : "false"};
+
+      function agEscHtml(s) {
+        return String(s == null ? "" : s).replace(/[&<>"']/g, function(c) {
+          return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
+        });
+      }
+
+      function agFmtReset(t) {
+        if (!t) return "N/A";
+        var target = new Date(t);
+        if (isNaN(target.getTime())) return "N/A";
+        var diff = target.getTime() - Date.now();
+        if (diff <= 0) return "\u5373\u5C06\u91CD\u7F6E";
+        var h = Math.floor(diff / 3600000);
+        var m = Math.floor((diff % 3600000) / 60000);
+        if (h >= 24) return Math.floor(h / 24) + "d " + (h % 24) + "h";
+        return h + "h " + m + "m";
+      }
+
+      function agBarColor(p) {
+        if (p >= 50) return "#28a745";
+        if (p >= 20) return "#fd7e14";
+        return "#dc3545";
+      }
+
+      function agBadgeStyle(p) {
+        if (p >= 50) return "background:#d4edda;color:#155724;";
+        if (p >= 20) return "background:#fff3cd;color:#856404;";
+        return "background:#f8d7da;color:#721c24;";
+      }
+
+      function agProgress(p) {
+        var pc = Math.max(0, Math.min(100, Math.round(p || 0)));
+        return '<div style="height:8px;background:#e9ecef;border-radius:4px;margin-top:4px;overflow:hidden;">' +
+          '<div style="height:100%;width:' + pc + '%;background:' + agBarColor(pc) + ';border-radius:4px;transition:width .5s;"></div></div>';
+      }
+
+      function agPctBadge(p) {
+        var pc = Math.max(0, Math.min(100, Math.round(p || 0)));
+        return '<span style="font-size:12px;font-weight:bold;padding:2px 8px;border-radius:4px;' + agBadgeStyle(pc) + '">' + pc + '%</span>';
+      }
+
+      async function loadAntigravityQuota(force) {
+        var statusEl = document.getElementById("ag-quota-status");
+        var contentEl = document.getElementById("ag-quota-content");
+        var btn = document.getElementById("ag-quota-refresh-btn");
+        if (btn) { btn.disabled = true; btn.textContent = "\u5237\u65B0\u4E2D..."; }
+        statusEl.innerHTML = "\u6B63\u5728\u83B7\u53D6\u914D\u989D...";
+        try {
+          var res = await fetch("/api/antigravity/quota" + (force ? "?refresh=1" : ""));
+          var data;
+          try { data = await res.json(); } catch (e) { data = {}; }
+          if (!res.ok) {
+            statusEl.innerHTML = '<span style="color:red;">\u2716 ' + agEscHtml(data.error || ("HTTP " + res.status)) + '</span>';
+            return;
+          }
+          statusEl.innerHTML = "\u2705 \u66F4\u65B0\u4E8E " + new Date((data.last_updated || 0) * 1000).toLocaleTimeString();
+          if (data.is_forbidden) {
+            contentEl.innerHTML = '<div style="background:#f8d7da;color:#721c24;padding:10px;border-radius:6px;">' + agEscHtml(data.forbidden_reason || "\u8BE5\u8D26\u53F7\u5DF2\u88AB\u4E0A\u6E38\u7981\u6B62\u8BBF\u95EE\u914D\u989D\u63A5\u53E3 (403 Forbidden)") + '</div>';
+            return;
+          }
+          var html = "";
+          if (data.subscription_tier) {
+            html += '<div style="margin-bottom:8px;font-size:13px;"><b>\u8BA2\u9605\u7B49\u7EA7:</b> <span style="background:#e2e3f0;color:#383d73;padding:2px 8px;border-radius:4px;font-weight:bold;">' + agEscHtml(data.subscription_tier) + '</span></div>';
+          }
+          var models = data.models || [];
+          if (models.length === 0) {
+            html += '<div style="color:#888;font-size:13px;">' + agEscHtml("\u672A\u83B7\u53D6\u5230\u6A21\u578B\u914D\u989D\u6570\u636E\uFF08\u4E0A\u6E38\u53EF\u80FD\u8FD4\u56DE\u4E3A\u7A7A\uFF09\u3002") + '</div>';
+          } else {
+            html += '<div style="font-weight:bold;margin:10px 0 6px;font-size:14px;">\u6A21\u578B\u914D\u989D (' + models.length + ')</div>';
+            for (var i = 0; i < models.length; i++) {
+              var m = models[i];
+              var p = Math.max(0, Math.min(100, Math.round(m.percentage || 0)));
+              var label = m.display_name || m.name;
+              html +=
+                '<div style="display:flex;justify-content:space-between;align-items:center;font-size:13px;margin-top:8px;">' +
+                  '<span style="font-family:monospace;word-break:break-all;">' + agEscHtml(label) +
+                    (m.thinking_budget != null ? ' <span style="font-size:10px;color:#6c757d;">(\u9884\u7B97 ' + agEscHtml(m.thinking_budget) + ')</span>' : '') +
+                  '</span>' + agPctBadge(p) +
+                '</div>' + agProgress(p) +
+                '<div style="font-size:11px;color:#6c757d;margin-top:2px;word-break:break-all;">\u91CD\u7F6E: ' + agEscHtml(agFmtReset(m.reset_time)) + ' \u00B7 ' + agEscHtml(m.name) + '</div>';
+            }
+          }
+          var groups = data.quota_groups || [];
+          if (groups.length > 0) {
+            html += '<div style="font-weight:bold;margin:16px 0 6px;font-size:14px;">\u5206\u7EC4\u914D\u989D\uFF085 \u5C0F\u65F6 / \u6BCF\u5468\u7A97\u53E3\uFF09</div>';
+            for (var g = 0; g < groups.length; g++) {
+              var grp = groups[g];
+              html += '<div style="border:1px solid #b8daff;background:#e9f2ff;border-radius:8px;padding:10px;margin-top:8px;">';
+              html += '<div style="font-weight:bold;font-size:13px;color:#004085;">' + agEscHtml(grp.display_name) + '</div>';
+              if (grp.description) html += '<div style="font-size:11px;color:#6c757d;">' + agEscHtml(grp.description) + '</div>';
+              var buckets = grp.buckets || [];
+              for (var b = 0; b < buckets.length; b++) {
+                var bk = buckets[b];
+                var bp = Math.max(0, Math.min(100, Math.round((bk.remaining_fraction || 0) * 100)));
+                var windowLabel = bk.display_name || bk.window || bk.bucket_id || "\u2014";
+                html +=
+                  '<div style="display:flex;justify-content:space-between;align-items:center;font-size:12px;margin-top:8px;">' +
+                    '<span style="font-weight:bold;text-transform:uppercase;word-break:break-all;">' + agEscHtml(windowLabel) + '</span>' + agPctBadge(bp) +
+                  '</div>' + agProgress(bp) +
+                  '<div style="font-size:11px;color:#6c757d;margin-top:2px;">\u91CD\u7F6E: ' + agEscHtml(agFmtReset(bk.reset_time)) + '</div>';
+              }
+              html += '</div>';
+            }
+          }
+          contentEl.innerHTML = html || '<div style="color:#888;">\u65E0\u914D\u989D\u6570\u636E\u3002</div>';
+        } catch (e) {
+          statusEl.innerHTML = '<span style="color:red;">\u2716 \u8BF7\u6C42\u5931\u8D25: ' + agEscHtml(e.message || String(e)) + '</span>';
+        } finally {
+          if (btn) { btn.disabled = false; btn.textContent = "\u5237\u65B0\u914D\u989D"; }
+        }
+      }
+
+      if (agQuotaHasAntigravity) {
+        loadAntigravityQuota(false);
+      }
     <\/script>
 
 	<p>\u6CE8\u610F\uFF1AGeminiCodeAssist\u4E2A\u4EBA\u7248\u5C06\u4E8E2026\u5E746\u670818\u65E5\u505C\u6B62\u670D\u52A1\uFF0C\u5C4A\u65F6CodeAssist\u6A21\u5F0F\u8C03\u7528\u53EF\u80FD\u5C06\u65E0\u6CD5\u4F7F\u7528\uFF0C\u4E14\u6CE8\u610FCodeAssist\u8C03\u7528\u7684\u6BCF\u5206\u949F\u901F\u7387\u9650\u5236\u8F83\u4E3A\u4E25\u683C\u3002<br>
@@ -1811,6 +1937,238 @@ async function ensureGeminiProject(accessToken, mode) {
 }
 __name(ensureGeminiProject, "ensureGeminiProject");
 __name2(ensureGeminiProject, "ensureGeminiProject");
+var ANTIGRAVITY_QUOTA_ENDPOINTS = [
+  "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal",
+  "https://daily-cloudcode-pa.googleapis.com/v1internal",
+  "https://cloudcode-pa.googleapis.com/v1internal"
+];
+var ANTIGRAVITY_QUOTA_UA = "Antigravity/4.2.1 (Macintosh; Intel Mac OS X 10_15_7) Chrome/132.0.6834.160 Electron/39.2.3";
+async function antigravityQuotaFetchJson(url, accessToken, payload) {
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${accessToken}`,
+      "Content-Type": "application/json",
+      "User-Agent": ANTIGRAVITY_QUOTA_UA,
+      "x-client-name": "antigravity",
+      "x-client-version": "4.2.1"
+    },
+    body: JSON.stringify(payload || {})
+  });
+  if (!res.ok) {
+    let text = "";
+    try {
+      text = await res.text();
+    } catch (e) {
+    }
+    return { ok: false, status: res.status, text };
+  }
+  let data;
+  try {
+    data = await res.json();
+  } catch (e) {
+    return { ok: false, status: 0, text: "Invalid JSON from upstream" };
+  }
+  return { ok: true, status: res.status, data };
+}
+__name(antigravityQuotaFetchJson, "antigravityQuotaFetchJson");
+__name2(antigravityQuotaFetchJson, "antigravityQuotaFetchJson");
+async function fetchAntigravityProjectInfo(accessToken) {
+  const result = await antigravityQuotaFetchJson(
+    `${ANTIGRAVITY_QUOTA_ENDPOINTS[0]}:loadCodeAssist`,
+    accessToken,
+    { metadata: { ideType: "ANTIGRAVITY" } }
+  );
+  if (!result.ok || !result.data) return { projectId: null, subscriptionTier: null };
+  const d = result.data;
+  const projectId = d.cloudaicompanionProject || null;
+  const isIneligible = Array.isArray(d.ineligibleTiers) && d.ineligibleTiers.length > 0;
+  let tier = d.paidTier?.name || d.paidTier?.id || null;
+  if (!tier) {
+    if (!isIneligible) {
+      tier = d.currentTier?.name || d.currentTier?.id || null;
+    } else {
+      const allowed = Array.isArray(d.allowedTiers) ? d.allowedTiers : [];
+      const defTier = allowed.find((t) => t.isDefault === true) || allowed[0] || null;
+      if (defTier) {
+        tier = (defTier.name || defTier.id || "UNKNOWN") + " (Restricted)";
+      }
+    }
+  }
+  return { projectId, subscriptionTier: tier };
+}
+__name(fetchAntigravityProjectInfo, "fetchAntigravityProjectInfo");
+__name2(fetchAntigravityProjectInfo, "fetchAntigravityProjectInfo");
+async function fetchAntigravityModels(accessToken, projectId) {
+  const basePayload = projectId ? { project: projectId } : {};
+  let lastErr = null;
+  for (let i = 0; i < ANTIGRAVITY_QUOTA_ENDPOINTS.length; i++) {
+    const ep = ANTIGRAVITY_QUOTA_ENDPOINTS[i];
+    const hasNext = i + 1 < ANTIGRAVITY_QUOTA_ENDPOINTS.length;
+    let payload = basePayload;
+    let retryWithoutProject = false;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const res = await antigravityQuotaFetchJson(`${ep}:fetchAvailableModels`, accessToken, payload);
+      if (res.ok && res.data) return { data: res.data };
+      lastErr = res;
+      if (res.status === 403) {
+        if (payload.project && !retryWithoutProject) {
+          payload = {};
+          retryWithoutProject = true;
+          continue;
+        }
+        return { forbidden: true, text: res.text };
+      }
+      if (res.status === 429 || res.status === 408 || res.status >= 500) {
+        if (hasNext) break;
+        return { error: `HTTP ${res.status} ${res.text}` };
+      }
+      return { error: `HTTP ${res.status} ${res.text}` };
+    }
+  }
+  return { error: lastErr ? `HTTP ${lastErr.status} ${lastErr.text}` : "All endpoints failed" };
+}
+__name(fetchAntigravityModels, "fetchAntigravityModels");
+__name2(fetchAntigravityModels, "fetchAntigravityModels");
+async function fetchAntigravityQuotaSummary(accessToken, projectId) {
+  const payload = projectId ? { project: projectId } : {};
+  for (let i = 0; i < ANTIGRAVITY_QUOTA_ENDPOINTS.length; i++) {
+    const res = await antigravityQuotaFetchJson(
+      `${ANTIGRAVITY_QUOTA_ENDPOINTS[i]}:retrieveUserQuotaSummary`,
+      accessToken,
+      payload
+    );
+    if (res.ok && res.data && Array.isArray(res.data.groups)) {
+      return res.data.groups.map((g) => ({
+        display_name: g.displayName || "",
+        description: g.description || null,
+        buckets: (g.buckets || []).map((b) => ({
+          bucket_id: b.bucketId || "",
+          window: b.window || "",
+          remaining_fraction: typeof b.remainingFraction === "number" ? b.remainingFraction : 0,
+          reset_time: b.resetTime || "",
+          display_name: b.displayName || null,
+          description: b.description || null
+        }))
+      }));
+    }
+    if (res.status >= 400 && res.status !== 429) return null;
+  }
+  return null;
+}
+__name(fetchAntigravityQuotaSummary, "fetchAntigravityQuotaSummary");
+__name2(fetchAntigravityQuotaSummary, "fetchAntigravityQuotaSummary");
+async function handleAntigravityQuota(request, env, ctx) {
+  const username = await getSessionUser(request, env);
+  if (!username) return jsonResponse({ error: "Unauthorized" }, 401);
+  const user = await env.GEMINI_KV.get(`user:${username}`, "json");
+  if (!user) return jsonResponse({ error: "User not found" }, 404);
+  const tokens = user.antigravity_tokens;
+  if (!tokens || !tokens.access_token) {
+    return jsonResponse({ error: "Antigravity \u6A21\u5F0F\u5C1A\u672A\u7ED1\u5B9A Google \u8D26\u53F7\uFF0C\u8BF7\u5148\u5728\u63A7\u5236\u53F0\u5B8C\u6210\u6388\u6743" }, 400);
+  }
+  const url = new URL(request.url);
+  const forceRefresh = url.searchParams.get("refresh") === "1";
+  if (!forceRefresh) {
+    const cached = await env.GEMINI_KV.get(`quota:${username}:antigravity`, "json");
+    if (cached && cached.last_updated) {
+      return jsonResponse(cached);
+    }
+  }
+  let { access_token, refresh_token, expires_at } = tokens;
+  if (Math.floor(Date.now() / 1e3) + 60 >= (expires_at || 0)) {
+    const oauthConfig = getOauthConfig("antigravity", env);
+    const tokenRes = await fetch("https://oauth2.googleapis.com/token", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "refresh_token",
+        refresh_token,
+        client_id: oauthConfig.client_id,
+        client_secret: oauthConfig.client_secret
+      })
+    });
+    if (!tokenRes.ok) {
+      return jsonResponse({ error: "Antigravity Token \u5DF2\u8FC7\u671F\u4E14\u5237\u65B0\u5931\u8D25\uFF0C\u8BF7\u91CD\u65B0\u5728\u63A7\u5236\u53F0\u5B8C\u6210\u6388\u6743" }, 401);
+    }
+    const td = await tokenRes.json();
+    access_token = td.access_token;
+    tokens.access_token = access_token;
+    tokens.refresh_token = td.refresh_token || refresh_token;
+    tokens.expires_at = Math.floor(Date.now() / 1e3) + (td.expires_in || 3600);
+    user.antigravity_tokens = tokens;
+    ctx.waitUntil(env.GEMINI_KV.put(`user:${username}`, JSON.stringify(user)));
+  }
+  try {
+    const { projectId, subscriptionTier } = await fetchAntigravityProjectInfo(access_token);
+    if (projectId && projectId !== tokens.project_id) {
+      tokens.project_id = projectId;
+      user.antigravity_tokens = tokens;
+      ctx.waitUntil(env.GEMINI_KV.put(`user:${username}`, JSON.stringify(user)));
+    }
+    const modelResult = await fetchAntigravityModels(access_token, projectId);
+    if (modelResult.forbidden) {
+      const forbiddenResult = {
+        models: [],
+        quota_groups: null,
+        subscription_tier: subscriptionTier,
+        project_id: projectId,
+        last_updated: Math.floor(Date.now() / 1e3),
+        is_forbidden: true,
+        forbidden_reason: modelResult.text || "403 Forbidden"
+      };
+      ctx.waitUntil(env.GEMINI_KV.put(`quota:${username}:antigravity`, JSON.stringify(forbiddenResult), { expirationTtl: 60 }));
+      return jsonResponse(forbiddenResult);
+    }
+    if (modelResult.error) {
+      return jsonResponse({ error: `\u83B7\u53D6\u914D\u989D\u5931\u8D25: ${modelResult.error}` }, 502);
+    }
+    const data = modelResult.data;
+    const models = [];
+    const modelForwardingRules = {};
+    for (const [name, info] of Object.entries(data.models || {})) {
+      const quotaInfo = info.quotaInfo;
+      if (!quotaInfo) continue;
+      const nameLower = name.toLowerCase();
+      if (!nameLower.startsWith("gemini") && !nameLower.startsWith("claude") && !nameLower.startsWith("gpt") && !nameLower.startsWith("image") && !nameLower.startsWith("imagen")) continue;
+      const percentage = typeof quotaInfo.remainingFraction === "number" ? Math.round(quotaInfo.remainingFraction * 100) : 0;
+      models.push({
+        name,
+        percentage,
+        reset_time: quotaInfo.resetTime || "",
+        display_name: info.displayName || null,
+        supports_images: typeof info.supportsImages === "boolean" ? info.supportsImages : null,
+        supports_thinking: typeof info.supportsThinking === "boolean" ? info.supportsThinking : null,
+        thinking_budget: typeof info.thinkingBudget === "number" ? info.thinkingBudget : null,
+        recommended: typeof info.recommended === "boolean" ? info.recommended : null,
+        max_tokens: typeof info.maxTokens === "number" ? info.maxTokens : null,
+        max_output_tokens: typeof info.maxOutputTokens === "number" ? info.maxOutputTokens : null
+      });
+    }
+    if (data.deprecatedModelIds && typeof data.deprecatedModelIds === "object") {
+      for (const [oldId, depInfo] of Object.entries(data.deprecatedModelIds)) {
+        if (depInfo && depInfo.newModelId) modelForwardingRules[oldId] = depInfo.newModelId;
+      }
+    }
+    const quotaGroups = await fetchAntigravityQuotaSummary(access_token, projectId);
+    const result = {
+      models,
+      quota_groups: quotaGroups,
+      subscription_tier: subscriptionTier,
+      project_id: projectId,
+      model_forwarding_rules: modelForwardingRules,
+      last_updated: Math.floor(Date.now() / 1e3),
+      is_forbidden: false,
+      forbidden_reason: null
+    };
+    ctx.waitUntil(env.GEMINI_KV.put(`quota:${username}:antigravity`, JSON.stringify(result), { expirationTtl: 60 }));
+    return jsonResponse(result);
+  } catch (e) {
+    return jsonResponse({ error: e.message || String(e) }, 502);
+  }
+}
+__name(handleAntigravityQuota, "handleAntigravityQuota");
+__name2(handleAntigravityQuota, "handleAntigravityQuota");
 async function handleModelsList(request) {
   const models = [
     "gemini-3.5-flash-low",
@@ -2716,6 +3074,7 @@ var worker_default = {
     if (url.pathname === "/api/auth/google/start") return startGoogleAuth(request, env);
     if (url.pathname === "/api/auth/google/callback") return handleGoogleCallback(request, env, ctx);
     if (url.pathname === "/api/user/update") return handleUserUpdate(request, env);
+    if (url.pathname === "/api/antigravity/quota") return handleAntigravityQuota(request, env, ctx);
     const parts = url.pathname.split("/").filter(Boolean);
     let customPath = null;
     let remainingPath = "";
