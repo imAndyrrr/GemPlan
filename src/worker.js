@@ -1489,6 +1489,7 @@ async function handleDashboard(request, env) {
       <div style="background:#f4f4f4;padding:10px;margin-top:10px;font-size:13px;word-break:break-all;">
         <b>\u8C03\u7528\u8BF4\u660E:</b><br>
         OpenAI \u683C\u5F0F: <code>https://${new URL(request.url).host}/${user.api_config.custom_path}/v1/chat/completions</code><br>
+        \u6A21\u578B\u5217\u8868: <code>https://${new URL(request.url).host}/${user.api_config.custom_path}/v1/models</code> (GET)<br>
         Claude \u683C\u5F0F: <code>https://${new URL(request.url).host}/${user.api_config.custom_path}/v1/messages</code><br>
         Gemini \u683C\u5F0F: <code>https://${new URL(request.url).host}/${user.api_config.custom_path}/v1beta/models/{modelname}:generateContent</code><br>
         Auth Header: <code>Authorization: Bearer ${user.api_config.api_key}</code>
@@ -2058,21 +2059,16 @@ async function fetchAntigravityQuotaSummary(accessToken, projectId) {
 }
 __name(fetchAntigravityQuotaSummary, "fetchAntigravityQuotaSummary");
 __name2(fetchAntigravityQuotaSummary, "fetchAntigravityQuotaSummary");
-async function handleAntigravityQuota(request, env, ctx) {
-  const username = await getSessionUser(request, env);
-  if (!username) return jsonResponse({ error: "Unauthorized" }, 401);
-  const user = await env.GEMINI_KV.get(`user:${username}`, "json");
-  if (!user) return jsonResponse({ error: "User not found" }, 404);
+// 获取用户 Antigravity 配额数据（带 60s KV 缓存）。返回 { data } 或 { error, status }。
+async function fetchAntigravityQuotaData(user, username, env, ctx, forceRefresh) {
   const tokens = user.antigravity_tokens;
   if (!tokens || !tokens.access_token) {
-    return jsonResponse({ error: "Antigravity \u6A21\u5F0F\u5C1A\u672A\u7ED1\u5B9A Google \u8D26\u53F7\uFF0C\u8BF7\u5148\u5728\u63A7\u5236\u53F0\u5B8C\u6210\u6388\u6743" }, 400);
+    return { error: "Antigravity \u6A21\u5F0F\u5C1A\u672A\u7ED1\u5B9A Google \u8D26\u53F7\uFF0C\u8BF7\u5148\u5728\u63A7\u5236\u53F0\u5B8C\u6210\u6388\u6743", status: 400 };
   }
-  const url = new URL(request.url);
-  const forceRefresh = url.searchParams.get("refresh") === "1";
   if (!forceRefresh) {
     const cached = await env.GEMINI_KV.get(`quota:${username}:antigravity`, "json");
     if (cached && cached.last_updated) {
-      return jsonResponse(cached);
+      return { data: cached };
     }
   }
   let { access_token, refresh_token, expires_at } = tokens;
@@ -2089,7 +2085,7 @@ async function handleAntigravityQuota(request, env, ctx) {
       })
     });
     if (!tokenRes.ok) {
-      return jsonResponse({ error: "Antigravity Token \u5DF2\u8FC7\u671F\u4E14\u5237\u65B0\u5931\u8D25\uFF0C\u8BF7\u91CD\u65B0\u5728\u63A7\u5236\u53F0\u5B8C\u6210\u6388\u6743" }, 401);
+      return { error: "Antigravity Token \u5DF2\u8FC7\u671F\u4E14\u5237\u65B0\u5931\u8D25\uFF0C\u8BF7\u91CD\u65B0\u5728\u63A7\u5236\u53F0\u5B8C\u6210\u6388\u6743", status: 401 };
     }
     const td = await tokenRes.json();
     access_token = td.access_token;
@@ -2118,10 +2114,10 @@ async function handleAntigravityQuota(request, env, ctx) {
         forbidden_reason: modelResult.text || "403 Forbidden"
       };
       ctx.waitUntil(env.GEMINI_KV.put(`quota:${username}:antigravity`, JSON.stringify(forbiddenResult), { expirationTtl: 60 }));
-      return jsonResponse(forbiddenResult);
+      return { data: forbiddenResult };
     }
     if (modelResult.error) {
-      return jsonResponse({ error: `\u83B7\u53D6\u914D\u989D\u5931\u8D25: ${modelResult.error}` }, 502);
+      return { error: `\u83B7\u53D6\u914D\u989D\u5931\u8D25: ${modelResult.error}`, status: 502 };
     }
     const data = modelResult.data;
     const models = [];
@@ -2162,24 +2158,86 @@ async function handleAntigravityQuota(request, env, ctx) {
       forbidden_reason: null
     };
     ctx.waitUntil(env.GEMINI_KV.put(`quota:${username}:antigravity`, JSON.stringify(result), { expirationTtl: 60 }));
-    return jsonResponse(result);
+    return { data: result };
   } catch (e) {
-    return jsonResponse({ error: e.message || String(e) }, 502);
+    return { error: e.message || String(e), status: 502 };
   }
+}
+__name(fetchAntigravityQuotaData, "fetchAntigravityQuotaData");
+__name2(fetchAntigravityQuotaData, "fetchAntigravityQuotaData");
+async function handleAntigravityQuota(request, env, ctx) {
+  const username = await getSessionUser(request, env);
+  if (!username) return jsonResponse({ error: "Unauthorized" }, 401);
+  const user = await env.GEMINI_KV.get(`user:${username}`, "json");
+  if (!user) return jsonResponse({ error: "User not found" }, 404);
+  const url = new URL(request.url);
+  const forceRefresh = url.searchParams.get("refresh") === "1";
+  const result = await fetchAntigravityQuotaData(user, username, env, ctx, forceRefresh);
+  if (result.error) return jsonResponse({ error: result.error }, result.status || 502);
+  return jsonResponse(result.data);
 }
 __name(handleAntigravityQuota, "handleAntigravityQuota");
 __name2(handleAntigravityQuota, "handleAntigravityQuota");
-async function handleModelsList(request) {
-  const models = [
+// 获取用户 Antigravity 模式的可用模型列表（OpenAI /v1/models 兼容格式）。
+// 模型 id 会套用用户配置的 antigravity_pattern（如 {modelname}-agy），保证可直接用于调用。
+// 获取失败（未绑定/403/网络错误/为空）时返回 null，由调用方决定回退策略。
+async function getAntigravityModelList(user, username, env, ctx) {
+  const result = await fetchAntigravityQuotaData(user, username, env, ctx, false);
+  if (result.error || !result.data || result.data.is_forbidden) return null;
+  const models = result.data.models || [];
+  if (models.length === 0) return null;
+  const pattern = (user.api_config && user.api_config.antigravity_pattern) || "{modelname}-agy";
+  const hasPlaceholder = pattern.includes("{modelname}");
+  return models.map((m) => ({
+    id: hasPlaceholder ? pattern.replace("{modelname}", m.name) : m.name,
+    object: "model",
+    created: 1715644800,
+    owned_by: "antigravity",
+    physical_model: m.name,
+    display_name: m.display_name,
+    quota_percentage: m.percentage,
+    reset_time: m.reset_time,
+    supports_thinking: m.supports_thinking,
+    thinking_budget: m.thinking_budget,
+    supports_images: m.supports_images,
+    max_tokens: m.max_tokens,
+    max_output_tokens: m.max_output_tokens,
+    recommended: m.recommended
+  }));
+}
+__name(getAntigravityModelList, "getAntigravityModelList");
+__name2(getAntigravityModelList, "getAntigravityModelList");
+async function handleModelsList(request, env, ctx, customPath) {
+  const fallbackModels = [
     "gemini-3.5-flash-low",
     "gemini-3.5-flash",
     "gpt-4o",
     "claude-3-5-sonnet-20241022",
     "claude-opus-4"
   ];
+  const apiKey = extractApiKey(request);
+  let username = null;
+  if (apiKey) {
+    username = await env.GEMINI_KV.get(`key:${apiKey}`);
+  } else if (customPath) {
+    username = await env.GEMINI_KV.get(`path:${customPath}`);
+  }
+  if (username) {
+    const user = await env.GEMINI_KV.get(`user:${username}`, "json");
+    if (user) {
+      try {
+        const antigravityModels = await getAntigravityModelList(user, username, env, ctx);
+        if (antigravityModels && antigravityModels.length > 0) {
+          return jsonResponse({ object: "list", data: antigravityModels });
+        }
+      } catch (e) {
+        console.warn(`[models] Failed to fetch antigravity model list for ${username}, falling back to static list:`, e.message || e);
+      }
+    }
+  }
   return jsonResponse({
     object: "list",
-    data: models.map((m) => ({ id: m, object: "model", created: 1715644800, owned_by: "system" }))
+    data: fallbackModels.map((m) => ({ id: m, object: "model", created: 1715644800, owned_by: "system" }))
   });
 }
 __name(handleModelsList, "handleModelsList");
@@ -3092,7 +3150,7 @@ var worker_default = {
       remainingPath = remainingPath.substring(0, remainingPath.length - "/chat/completions".length);
     }
     if (remainingPath === "/v1/models" || remainingPath === "/v1beta/models" || remainingPath === "/models") {
-      return handleModelsList(request);
+      return handleModelsList(request, env, ctx, customPath);
     }
     let apiType = null;
     if (remainingPath === "/v1/chat/completions" || remainingPath === "/chat/completions") {
