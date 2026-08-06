@@ -2390,9 +2390,37 @@ async function handleApiProxy(request, env, ctx, customPath, apiType) {
   let responseData = null;
   let sseLines = null;
   const MAX_RETRIES = 3;
+  // 上游（Antigravity agent API）会对字节级相同的请求体做短时结果缓存：
+  // 完全相同的请求会连续返回空响应（对应 CCR 侧大量 500 "empty response"）。
+  // 因此在重试（attempt>1）时对请求体做一次惰性克隆并追加一条 user「继续」
+  // 消息，使每次重试的请求体不同以破除该上游缓存。仅 antigravity 模式生效；
+  // 第 1 次尝试保持原始请求不变；追加内容只作用于当次发送，不影响原始
+  // contents / KV 存储 / 最终响应。
+  const RETRY_CONTINUE_TEXTS = ["继续", "继续。", "请继续。"];
+  const buildAttemptPayload = (basePayload, attempt, isAntigravity) => {
+    if (!isAntigravity || attempt <= 1) return basePayload;
+    const request = basePayload && basePayload.request;
+    const contents = request && request.contents;
+    if (!request || !Array.isArray(contents)) return basePayload;
+    // 末尾若为待处理的 functionCall（model/assistant 消息以 functionCall 结尾），
+    // 追加 user 消息可能干扰工具配对，此时退回原始请求、不注入内容变化。
+    const last = contents[contents.length - 1];
+    const lastPart = last && Array.isArray(last.parts) ? last.parts[last.parts.length - 1] : null;
+    const hasPendingToolCall = !!lastPart && !!lastPart.functionCall && typeof lastPart.functionCall === "object";
+    if (hasPendingToolCall) return basePayload;
+    const text = RETRY_CONTINUE_TEXTS[(attempt - 2) % RETRY_CONTINUE_TEXTS.length];
+    return {
+      ...basePayload,
+      request: {
+        ...request,
+        contents: contents.concat([{ role: "user", parts: [{ text }] }])
+      }
+    };
+  };
   for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+    const attemptPayload = buildAttemptPayload(cloudCodePayload, attempt, mode === "antigravity");
     try {
-      googleRes = await callUpstream(method, requestHeaders, cloudCodePayload, useStreamUpstream);
+      googleRes = await callUpstream(method, requestHeaders, attemptPayload, useStreamUpstream);
     } catch (err) {
       if (attempt === MAX_RETRIES) {
         return jsonResponse({ error: err.message || String(err) }, 500);
