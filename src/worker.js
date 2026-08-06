@@ -1737,7 +1737,7 @@ async function handleDashboard(request, env) {
               html +=
                 '<div style="display:flex;justify-content:space-between;align-items:center;font-size:13px;margin-top:8px;">' +
                   '<span style="font-family:monospace;word-break:break-all;">' + agEscHtml(label) +
-                    (m.thinking_budget > 0 ? ' <span style="font-size:10px;color:#6c757d;">(\u601D\u8003\u9884\u7B97 ' + agEscHtml(m.thinking_budget) + ')</span>' : '') +
+                    (m.thinking_budget_auto ? ' <span style="font-size:10px;color:#6c757d;">(\u81EA\u52A8\u601D\u8003\u9884\u7B97)</span>' : (m.thinking_budget > 0 ? ' <span style="font-size:10px;color:#6c757d;">(\u601D\u8003\u9884\u7B97 ' + agEscHtml(m.thinking_budget) + ')</span>' : '')) +
                   '</span>' + agPctBadge(p) +
                 '</div>' + agProgress(p) +
                 '<div style="font-size:11px;color:#6c757d;margin-top:2px;word-break:break-all;">\u91CD\u7F6E: ' + agEscHtml(agFmtReset(m.reset_time)) + ' \u00B7 ' + agEscHtml(m.name) + '</div>';
@@ -2128,6 +2128,7 @@ async function fetchAntigravityQuotaData(user, username, env, ctx, forceRefresh)
       const nameLower = name.toLowerCase();
       if (!nameLower.startsWith("gemini") && !nameLower.startsWith("claude") && !nameLower.startsWith("gpt") && !nameLower.startsWith("image") && !nameLower.startsWith("imagen")) continue;
       const percentage = typeof quotaInfo.remainingFraction === "number" ? Math.round(quotaInfo.remainingFraction * 100) : 0;
+      const rawBudget = typeof info.thinkingBudget === "number" ? info.thinkingBudget : null;
       models.push({
         name,
         percentage,
@@ -2135,7 +2136,8 @@ async function fetchAntigravityQuotaData(user, username, env, ctx, forceRefresh)
         display_name: info.displayName || null,
         supports_images: typeof info.supportsImages === "boolean" ? info.supportsImages : null,
         supports_thinking: typeof info.supportsThinking === "boolean" ? info.supportsThinking : null,
-        thinking_budget: typeof info.thinkingBudget === "number" && info.thinkingBudget > 0 ? info.thinkingBudget : null,
+        thinking_budget: rawBudget !== null && rawBudget > 0 ? rawBudget : null,
+        thinking_budget_auto: rawBudget !== null && rawBudget <= 0,
         recommended: typeof info.recommended === "boolean" ? info.recommended : null,
         max_tokens: typeof info.maxTokens === "number" ? info.maxTokens : null,
         max_output_tokens: typeof info.maxOutputTokens === "number" ? info.maxOutputTokens : null
@@ -2199,6 +2201,7 @@ async function getAntigravityModelList(user, username, env, ctx) {
     reset_time: m.reset_time,
     supports_thinking: m.supports_thinking,
     thinking_budget: m.thinking_budget,
+    thinking_budget_auto: m.thinking_budget_auto === true,
     supports_images: m.supports_images,
     max_tokens: m.max_tokens,
     max_output_tokens: m.max_output_tokens,
