@@ -1737,7 +1737,7 @@ async function handleDashboard(request, env) {
               html +=
                 '<div style="display:flex;justify-content:space-between;align-items:center;font-size:13px;margin-top:8px;">' +
                   '<span style="font-family:monospace;word-break:break-all;">' + agEscHtml(label) +
-                    (m.thinking_budget != null ? ' <span style="font-size:10px;color:#6c757d;">(\u601D\u8003\u9884\u7B97 ' + agEscHtml(m.thinking_budget) + ')</span>' : '') +
+                    (m.thinking_budget > 0 ? ' <span style="font-size:10px;color:#6c757d;">(\u601D\u8003\u9884\u7B97 ' + agEscHtml(m.thinking_budget) + ')</span>' : '') +
                   '</span>' + agPctBadge(p) +
                 '</div>' + agProgress(p) +
                 '<div style="font-size:11px;color:#6c757d;margin-top:2px;word-break:break-all;">\u91CD\u7F6E: ' + agEscHtml(agFmtReset(m.reset_time)) + ' \u00B7 ' + agEscHtml(m.name) + '</div>';
@@ -2135,7 +2135,7 @@ async function fetchAntigravityQuotaData(user, username, env, ctx, forceRefresh)
         display_name: info.displayName || null,
         supports_images: typeof info.supportsImages === "boolean" ? info.supportsImages : null,
         supports_thinking: typeof info.supportsThinking === "boolean" ? info.supportsThinking : null,
-        thinking_budget: typeof info.thinkingBudget === "number" ? info.thinkingBudget : null,
+        thinking_budget: typeof info.thinkingBudget === "number" && info.thinkingBudget > 0 ? info.thinkingBudget : null,
         recommended: typeof info.recommended === "boolean" ? info.recommended : null,
         max_tokens: typeof info.maxTokens === "number" ? info.maxTokens : null,
         max_output_tokens: typeof info.maxOutputTokens === "number" ? info.maxOutputTokens : null
