@@ -2428,6 +2428,7 @@ async function handleApiProxy(request, env, ctx, customPath, apiType) {
         const finalName = m.tool_call_id ? toolIdToName[m.tool_call_id] || name : name;
         if (Array.isArray(m.content)) {
           const textParts = [];
+          const mediaParts = [];
           for (const blk of m.content) {
             if ((blk.type === "text" || blk.type === "input_text") && blk.text) {
               textParts.push(typeof blk.text === "string" ? blk.text : JSON.stringify(blk.text));
@@ -2439,10 +2440,10 @@ async function handleApiProxy(request, env, ctx, customPath, apiType) {
                   if (commaIdx !== -1) {
                     const mimeType = imgUrl.substring(5, imgUrl.indexOf(";")) || "image/jpeg";
                     const data = imgUrl.substring(commaIdx + 1);
-                    parts.push({ inlineData: { mimeType, data } });
+                    mediaParts.push({ inlineData: { mimeType, data } });
                   }
                 } else {
-                  parts.push({ fileData: { fileUri: imgUrl, mimeType: blk.media_type || "image/jpeg" } });
+                  mediaParts.push({ fileData: { fileUri: imgUrl, mimeType: blk.media_type || "image/jpeg" } });
                 }
               }
             }
@@ -2450,10 +2451,17 @@ async function handleApiProxy(request, env, ctx, customPath, apiType) {
           // 无论 tool result 里是否只有图片/无文本，都必须生成 functionResponse，
           // 否则该 tool_use 没有紧邻的 tool_result，Anthropic 会报
           // "tool_use ids were found without tool_result blocks immediately after"。
+          // 图片等媒体必须嵌套在 functionResponse 内部（Gemini 3 多模态函数响应），
+          // 不能作为独立的并列 part —— 否则 Antigravity 后端转换时会把
+          // functionResponse 判定为缺失 tool_result（实测 400）。
+          const responseBody = { result: textParts.join("\n") };
+          if (mediaParts.length > 0) {
+            responseBody.parts = mediaParts;
+          }
           parts.push({
             functionResponse: {
               name: finalName,
-              response: { result: textParts.join("\n") },
+              response: responseBody,
               id: m.tool_call_id || ""
             }
           });
