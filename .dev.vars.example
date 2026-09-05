@@ -1,0 +1,10 @@
+# Copy this file to .dev.vars for local Wrangler development.
+# Never commit real OAuth credentials.
+CODEASSIST_CLIENT_ID=your_codeassist_client_id
+CODEASSIST_CLIENT_SECRET=your_codeassist_client_secret
+ANTIGRAVITY_CLIENT_ID=your_antigravity_client_id
+ANTIGRAVITY_CLIENT_SECRET=your_antigravity_client_secret
+
+# Optional when the OAuth callback address differs from the defaults.
+# CODEASSIST_REDIRECT_URI=http://localhost:8085/oauth2callback
+# ANTIGRAVITY_REDIRECT_URI=http://localhost:8080/callback
