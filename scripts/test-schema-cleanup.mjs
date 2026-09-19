@@ -28,7 +28,7 @@ const GOOGLE_FORBIDDEN_KEYS = [
   "exclusiveMaximum", "$dynamicRef", "$dynamicAnchor", "$anchor", "$comment"
 ];
 
-const code = `const __name = (f, n) => f; const __name2 = (f, n) => f;\nconst GOOGLE_FORBIDDEN_KEYS = ${JSON.stringify(GOOGLE_FORBIDDEN_KEYS)};\n${extract("collectAllDefs")}\n${extract("optimizeAndCleanSchema")}\nglobalThis.__fns = { collectAllDefs, optimizeAndCleanSchema };`;
+const code = `const __name = (f, n) => f; const __name2 = (f, n) => f;\nconst GOOGLE_FORBIDDEN_KEYS = ${JSON.stringify(GOOGLE_FORBIDDEN_KEYS)};\n${extract("mergeResolvedSchema")}\n${extract("collectAllDefs")}\n${extract("optimizeAndCleanSchema")}\nglobalThis.__fns = { collectAllDefs, optimizeAndCleanSchema };`;
 new Function(code)();
 
 const { optimizeAndCleanSchema } = globalThis.__fns;
@@ -139,6 +139,76 @@ deep.oneOf = [{ $ref: "#/$defs/X" }];
 schema5.$defs = { X: { type: "string" } };
 check("deep nesting with oneOf beyond depth 20 terminates", () => {
   optimizeAndCleanSchema(schema5, false);
+});
+
+// Case 6: anyOf collapsed under an outer placeholder `properties: {}` must keep
+// the branch definitions. Dropping them produced
+//   {type:"OBJECT", properties:{}, required:["threadId"]}
+// and Antigravity answered the whole request with 429 RESOURCE_EXHAUSTED.
+const schema6 = {
+  type: "object",
+  properties: {},
+  anyOf: [
+    {
+      type: "object",
+      properties: { context: { type: "string" }, hostId: { type: "string" }, threadId: { type: "string" } },
+      required: ["threadId"],
+      additionalProperties: false
+    },
+    {
+      type: "object",
+      properties: { context: { type: "string" }, return: { type: "boolean", enum: [true] } },
+      required: ["return"],
+      additionalProperties: false
+    }
+  ]
+};
+optimizeAndCleanSchema(schema6, true);
+check("anyOf branch properties survive an empty outer properties object", () => {
+  if (schema6.type !== "OBJECT") throw new Error(`type not uppercased: ${schema6.type}`);
+  const props = schema6.properties || {};
+  for (const name of ["threadId", "hostId", "context"]) {
+    if (!(name in props)) throw new Error(`branch property '${name}' was dropped`);
+    if (props[name].type !== "STRING") throw new Error(`property '${name}' not uppercased`);
+  }
+  if (!Array.isArray(schema6.required) || !schema6.required.includes("threadId")) {
+    throw new Error(`required must keep the branch entry: ${JSON.stringify(schema6.required)}`);
+  }
+  if ("anyOf" in schema6) throw new Error("collapsed anyOf must not survive");
+});
+
+// Case 6b: no schema may declare a required name that properties does not define.
+const branches = {
+  type: "object",
+  properties: {},
+  anyOf: [
+    { type: "object", properties: { a: { type: "string" } }, required: ["a", "ghost"] },
+    { type: "object", required: ["phantom"] }
+  ]
+};
+optimizeAndCleanSchema(branches, false);
+check("dangling required names are pruned", () => {
+  const props = branches.properties || {};
+  for (const name of branches.required || []) {
+    if (!(name in props)) throw new Error(`dangling required '${name}' survived`);
+  }
+  if (branches.required && !branches.required.includes("a")) {
+    throw new Error("defined required name was removed");
+  }
+});
+
+// Case 6c: the guard only drops dangling names; it never invents properties.
+const preserved = {
+  type: "object",
+  properties: { keep: { type: "string" } },
+  required: ["keep", "missing"]
+};
+optimizeAndCleanSchema(preserved, false);
+check("reconciled required keeps order and never adds properties", () => {
+  if (JSON.stringify(preserved.required) !== JSON.stringify(["keep"])) {
+    throw new Error(`unexpected required: ${JSON.stringify(preserved.required)}`);
+  }
+  if (Object.keys(preserved.properties).length !== 1) throw new Error("properties were synthesized");
 });
 
 console.log(failures === 0 ? "\nAll tests passed." : `\n${failures} test(s) FAILED.`);

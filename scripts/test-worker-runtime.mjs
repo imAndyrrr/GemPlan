@@ -2,6 +2,7 @@
 // These tests exercise the actual exported fetch handler rather than isolated
 // helpers, so route-level async exceptions and account failover are covered.
 import { readFileSync } from "node:fs";
+import assert from "node:assert/strict";
 import worker from "../src/worker.js";
 
 const workerSource = readFileSync(new URL("../src/worker.js", import.meta.url), "utf8");
@@ -669,6 +670,114 @@ try {
     console.log("PASS: OpenAI Responses non-stream requests and responses work");
   }
 
+  // 8a. Round-trip a signed Gemini tool call through actual Responses output
+  // and replay it alongside assistant text, matching the reported part index.
+  for (const stream of [false, true]) {
+    const account = {
+      id: `acc_responses_signature_${stream}`,
+      mode: "antigravity",
+      enabled: true,
+      status: "active",
+      tokens: {
+        access_token: "token-responses-signature",
+        refresh_token: "refresh-responses-signature",
+        expires_at: Math.floor(Date.now() / 1000) + 3600,
+        project_id: "project-responses-signature"
+      }
+    };
+    const kv = new MockKV({
+      "key:sk-runtime-test": "runtime-user",
+      "user:runtime-user": JSON.stringify(makeUser([account]))
+    });
+    const signature = "S".repeat(96);
+    const args = { query: "prior", thought_signature: "ordinary argument" };
+    let upstreamCalls = 0;
+    globalThis.fetch = async (_url, init = {}) => {
+      const payload = JSON.parse(init.body);
+      assert.equal(payload.model, "gemini-3.8-flash");
+      upstreamCalls++;
+      if (upstreamCalls === 1) {
+        const chunk = {
+          response: {
+            candidates: [{
+              content: {
+                role: "model",
+                parts: [
+                  { thought: true, text: "Need to look up the result." },
+                  { text: "Checking." },
+                  {
+                    functionCall: { id: "call_signed", name: "lookup", args },
+                    // Cover both spellings accepted from the upstream.
+                    [stream ? "thought_signature" : "thoughtSignature"]: signature
+                  }
+                ]
+              },
+              finishReason: "STOP"
+            }],
+            usageMetadata: { promptTokenCount: 2, candidatesTokenCount: 3, totalTokenCount: 5 }
+          }
+        };
+        return new Response(stream ? `data: ${JSON.stringify(chunk)}\n\n` : JSON.stringify(chunk), {
+          headers: { "Content-Type": stream ? "text/event-stream" : "application/json" }
+        });
+      }
+      assert.equal(upstreamCalls, 2, "tool follow-up should not retry a malformed payload");
+      const contents = payload.request.contents;
+      assert.equal(contents.length, 3, "full history must survive");
+      assert.equal(contents[1].parts[0].text, "Checking.");
+      const part = contents[1].parts[1];
+      assert.equal(part.thoughtSignature, signature);
+      assert.equal(part.thought_signature, signature);
+      assert.deepEqual(part.functionCall, { id: "call_signed", name: "lookup", args },
+        "upstream FunctionCall must not contain thoughtSignature/thought_signature");
+      assert.deepEqual(contents[2].parts[0].functionResponse, {
+        id: "call_signed", name: "lookup", response: { result: "prior result" }
+      });
+      return stream ? successStreamResponse("signed-roundtrip-ok") : successResponse("signed-roundtrip-ok");
+    };
+    const send = async (input) => {
+      const ctx = makeCtx();
+      const response = await worker.fetch(new Request("https://example.test/runtime-test/v1/responses", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: "Bearer sk-runtime-test" },
+        body: JSON.stringify({
+          model: "gemini-3.8-flash-agy",
+          input,
+          stream,
+          tools: [{
+            type: "function",
+            name: "lookup",
+            parameters: {
+              type: "object",
+              properties: { query: { type: "string" }, thought_signature: { type: "string" } }
+            }
+          }]
+        })
+      }), { GEMINI_KV: kv }, ctx);
+      const text = await response.text();
+      await ctx.drain();
+      assert.equal(response.status, 200, text);
+      if (!stream) return JSON.parse(text);
+      const completed = text.split("\n")
+        .filter((line) => line.startsWith("data: {"))
+        .map((line) => JSON.parse(line.slice(6)))
+        .find((event) => event.type === "response.completed");
+      assert.ok(completed, text);
+      return completed.response;
+    };
+    const input = [{ role: "user", content: "look it up" }];
+    const first = await send(input);
+    const toolCall = first.output.find((item) => item.type === "function_call");
+    assert.equal(toolCall?.call_id, `call_signed|${signature}`);
+    const final = await send([
+      ...input, ...first.output,
+      { type: "function_call_output", call_id: toolCall.call_id, output: "prior result" }
+    ]);
+    assert.equal(final.output_text, "signed-roundtrip-ok");
+    assert.equal(upstreamCalls, 2);
+    console.log(`PASS: Responses Gemini 3.8 Flash signed tool round-trip (${stream ? "stream" : "non-stream"})`);
+  }
+
   // 9. Responses streaming uses the event-based SSE protocol and emits a
   // final response object instead of Chat Completions chunks.
   {
@@ -736,6 +845,338 @@ try {
       throw new Error(`removed singular Responses route is still active: HTTP ${singularResponse.status}`);
     }
     console.log("PASS: OpenAI Responses streaming events work");
+  }
+  // 6. A tool schema whose outer placeholder carries an empty `properties`
+  // object must reach Google with the anyOf branch definitions merged in. The
+  // broken shape `{type:"OBJECT", properties:{}, required:["threadId"]}` is what
+  // made Antigravity answer the whole request with 429 RESOURCE_EXHAUSTED.
+  {
+    const now = Math.floor(Date.now() / 1000);
+    const account = {
+      id: "acc_schema_merge",
+      email: "schema@example.test",
+      mode: "antigravity",
+      enabled: true,
+      status: "active",
+      last_used_at: 0,
+      cooldown_until: 0,
+      machine_id: "machine-schema",
+      tokens: {
+        access_token: "token-schema",
+        refresh_token: "refresh-schema",
+        expires_at: now + 3600,
+        project_id: "project-schema"
+      }
+    };
+    const kv = new MockKV({
+      "key:sk-runtime-test": "runtime-user",
+      "user:runtime-user": JSON.stringify(makeUser([account]))
+    });
+    const sentPayloads = [];
+    globalThis.fetch = async (_url, init = {}) => {
+      sentPayloads.push(JSON.parse(init.body));
+      return successResponse("schema-ok");
+    };
+    const tool = {
+      type: "function",
+      function: {
+        name: "transfer_voice_call",
+        description: "Transfer the active voice call.",
+        parameters: {
+          type: "object",
+          properties: {},
+          anyOf: [
+            {
+              type: "object",
+              properties: { context: { type: "string" }, hostId: { type: "string" }, threadId: { type: "string" } },
+              required: ["threadId"],
+              additionalProperties: false
+            },
+            {
+              type: "object",
+              properties: { context: { type: "string" }, return: { type: "boolean", enum: [true] } },
+              required: ["return"],
+              additionalProperties: false
+            }
+          ]
+        }
+      }
+    };
+    const ctx = makeCtx();
+    const response = await worker.fetch(new Request("https://example.test/runtime-test/v1/chat/completions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Authorization": "Bearer sk-runtime-test" },
+      body: JSON.stringify({
+        model: "gemini-test-agy",
+        messages: [{ role: "user", content: "reply only OK" }],
+        stream: false,
+        tools: [tool]
+      })
+    }), { GEMINI_KV: kv }, ctx);
+    const data = await response.json();
+    await ctx.drain();
+
+    if (response.status !== 200 || data.choices?.[0]?.message?.content !== "schema-ok") {
+      throw new Error(`schema merge request failed: HTTP ${response.status} ${JSON.stringify(data)}`);
+    }
+    const declarations = sentPayloads[0]?.request?.tools?.[0]?.functionDeclarations || [];
+    const declaration = declarations.find((item) => item.name === "transfer_voice_call");
+    if (!declaration) {
+      throw new Error(`tool declaration missing upstream: ${JSON.stringify(declarations.map((d) => d.name))}`);
+    }
+    const parameters = declaration.parameters || {};
+    for (const name of ["threadId", "hostId", "context"]) {
+      if (!parameters.properties || !(name in parameters.properties)) {
+        throw new Error(`branch property '${name}' never reached Google: ${JSON.stringify(parameters)}`);
+      }
+      if (parameters.properties[name].type !== "STRING") {
+        throw new Error(`property '${name}' was not normalized: ${JSON.stringify(parameters.properties[name])}`);
+      }
+    }
+    if (parameters.type !== "OBJECT" || !Array.isArray(parameters.required) || !parameters.required.includes("threadId")) {
+      throw new Error(`schema shape changed: ${JSON.stringify(parameters)}`);
+    }
+    if ("anyOf" in parameters) throw new Error("anyOf must be collapsed before the upstream call");
+    for (const name of parameters.required) {
+      if (!(name in parameters.properties)) {
+        throw new Error(`dangling required '${name}' reached Google: ${JSON.stringify(parameters)}`);
+      }
+    }
+    console.log("PASS: collapsed anyOf tool schemas reach Google with merged properties");
+  }
+
+  // 7. A transient Antigravity 429 must stay inside the shared attempt budget.
+  // The old code nested another 3-attempt loop (plus a forced quota refresh)
+  // inside each attempt, so one client request could issue ~17 upstream calls
+  // and exceed the Worker CPU budget (Cloudflare Error 1102).
+  {
+    const now = Math.floor(Date.now() / 1000);
+    const account = {
+      id: "acc_single_429",
+      email: "single-429@example.test",
+      mode: "antigravity",
+      enabled: true,
+      status: "active",
+      last_used_at: 0,
+      cooldown_until: 0,
+      machine_id: "machine-single-429",
+      tokens: {
+        access_token: "token-single-429",
+        refresh_token: "refresh-single-429",
+        expires_at: now + 3600,
+        project_id: "project-single-429"
+      }
+    };
+    const kv = new MockKV({
+      "key:sk-runtime-test": "runtime-user",
+      "user:runtime-user": JSON.stringify(makeUser([account])),
+      "quota:runtime-user:acc_single_429": JSON.stringify({
+        models: [{ name: "gemini-test", percentage: 55 }],
+        last_updated: now
+      })
+    });
+    const urls = [];
+    globalThis.fetch = async (url) => {
+      urls.push(String(url));
+      return new Response(JSON.stringify({
+        error: { code: 429, message: "Resource has been exhausted (e.g. check quota).", status: "RESOURCE_EXHAUSTED" }
+      }), {
+        status: 429,
+        headers: { "Content-Type": "application/json" }
+      });
+    };
+    const ctx = makeCtx();
+    const response = await worker.fetch(apiRequest(), { GEMINI_KV: kv }, ctx);
+    const text = await response.text();
+    await ctx.drain();
+
+    const generationCalls = urls.filter((url) => /:generateContent|:streamGenerateContent/.test(url));
+    const quotaProbes = urls.filter((url) => /loadCodeAssist|fetchAvailableModels|retrieveUserQuotaSummary/.test(url));
+    if (response.status !== 429 || !text.includes("RESOURCE_EXHAUSTED")) {
+      throw new Error(`upstream 429 must reach the client: HTTP ${response.status} ${text}`);
+    }
+    if (generationCalls.length > 9) {
+      throw new Error(`429 retry storm: ${generationCalls.length} generation calls (expected at most 3 attempts x 3 endpoints)`);
+    }
+    if (quotaProbes.length !== 0) {
+      throw new Error(`429 recovery must reuse the cached quota: ${JSON.stringify(quotaProbes)}`);
+    }
+    console.log("PASS: transient Antigravity 429 stays within the shared attempt budget");
+  }
+  // 8. 400 INVALID_ARGUMENT is deterministic: it must not be retried on another
+  // endpoint or in the attempt loop. One request should cost exactly one
+  // upstream call and hand the upstream message straight to the client.
+  {
+    const now = Math.floor(Date.now() / 1000);
+    const account = {
+      id: "acc_400",
+      email: "bad-request@example.test",
+      mode: "antigravity",
+      enabled: true,
+      status: "active",
+      last_used_at: 0,
+      cooldown_until: 0,
+      machine_id: "machine-400",
+      tokens: {
+        access_token: "token-400",
+        refresh_token: "refresh-400",
+        expires_at: now + 3600,
+        project_id: "project-400"
+      }
+    };
+    const kv = new MockKV({
+      "key:sk-runtime-test": "runtime-user",
+      "user:runtime-user": JSON.stringify(makeUser([account]))
+    });
+    const urls = [];
+    globalThis.fetch = async (url) => {
+      urls.push(String(url));
+      return new Response(JSON.stringify({
+        error: { code: 400, message: "Request contains an invalid argument.", status: "INVALID_ARGUMENT" }
+      }), {
+        status: 400,
+        headers: { "Content-Type": "application/json" }
+      });
+    };
+    const ctx = makeCtx();
+    const response = await worker.fetch(apiRequest(), { GEMINI_KV: kv }, ctx);
+    const text = await response.text();
+    await ctx.drain();
+
+    if (response.status !== 400 || !text.includes("INVALID_ARGUMENT")) {
+      throw new Error(`400 must reach the client unchanged: HTTP ${response.status} ${text}`);
+    }
+    if (urls.length !== 1) {
+      throw new Error(`400 must not be retried, but ${urls.length} upstream calls were made: ${JSON.stringify(urls)}`);
+    }
+    console.log("PASS: upstream 400 is returned immediately without retries");
+  }
+
+  // 9. A single-account 429 must respect the per-request wait budget instead of
+  // sleeping through every Retry-After. Timers are recorded, not awaited.
+  {
+    const now = Math.floor(Date.now() / 1000);
+    const account = {
+      id: "acc_budget",
+      email: "budget@example.test",
+      mode: "antigravity",
+      enabled: true,
+      status: "active",
+      last_used_at: 0,
+      cooldown_until: 0,
+      machine_id: "machine-budget",
+      tokens: {
+        access_token: "token-budget",
+        refresh_token: "refresh-budget",
+        expires_at: now + 3600,
+        project_id: "project-budget"
+      }
+    };
+    const kv = new MockKV({
+      "key:sk-runtime-test": "runtime-user",
+      "user:runtime-user": JSON.stringify(makeUser([account])),
+      "quota:runtime-user:acc_budget": JSON.stringify({
+        models: [{ name: "gemini-test", percentage: 55 }],
+        last_updated: now
+      })
+    });
+    const urls = [];
+    globalThis.fetch = async (url) => {
+      urls.push(String(url));
+      return new Response(JSON.stringify({
+        error: { code: 429, message: "Resource has been exhausted (e.g. check quota).", status: "RESOURCE_EXHAUSTED" }
+      }), {
+        status: 429,
+        headers: { "Content-Type": "application/json", "Retry-After": "30" }
+      });
+    };
+    const realSetTimeout = globalThis.setTimeout;
+    const plannedWaits = [];
+    globalThis.setTimeout = (fn, ms, ...rest) => {
+      plannedWaits.push(Number(ms) || 0);
+      return realSetTimeout(fn, 0, ...rest);
+    };
+    let response;
+    let text;
+    try {
+      const ctx = makeCtx();
+      response = await worker.fetch(apiRequest(), { GEMINI_KV: kv }, ctx);
+      text = await response.text();
+      await ctx.drain();
+    } finally {
+      globalThis.setTimeout = realSetTimeout;
+    }
+
+    const totalWait = plannedWaits.reduce((sum, ms) => sum + ms, 0);
+    const generationCalls = urls.filter((url) => /:generateContent|:streamGenerateContent/.test(url)).length;
+    if (response.status !== 429 || !text.includes("RESOURCE_EXHAUSTED")) {
+      throw new Error(`budgeted 429 must reach the client: HTTP ${response.status} ${text}`);
+    }
+    if (totalWait > 20000) {
+      throw new Error(`wait budget exceeded: ${totalWait}ms planned (${JSON.stringify(plannedWaits)})`);
+    }
+    if (generationCalls !== 6) {
+      throw new Error(`budget must stop after the second attempt: ${generationCalls} generation calls (${JSON.stringify(plannedWaits)})`);
+    }
+    if (plannedWaits.length === 0) {
+      throw new Error("no backoff was planned for a transient 429");
+    }
+    console.log(`PASS: 429 wait budget caps backoff at ${totalWait}ms (${plannedWaits.length} wait(s), ${generationCalls} upstream calls)`);
+  }
+
+  // 10. A cold quota cache must not trigger a quota refresh inside 429 recovery.
+  // The recovery path only consults quota data that is already available; a cold
+  // cache used to fire project-info/models/quota-summary calls (three more
+  // upstream calls per attempt) on an already failing request.
+  {
+    const now = Math.floor(Date.now() / 1000);
+    const account = {
+      id: "acc_cold_quota",
+      email: "cold-quota@example.test",
+      mode: "antigravity",
+      enabled: true,
+      status: "active",
+      last_used_at: 0,
+      cooldown_until: 0,
+      machine_id: "machine-cold-quota",
+      tokens: {
+        access_token: "token-cold-quota",
+        refresh_token: "refresh-cold-quota",
+        expires_at: now + 3600,
+        project_id: "project-cold-quota"
+      }
+    };
+    const kv = new MockKV({
+      "key:sk-runtime-test": "runtime-user",
+      "user:runtime-user": JSON.stringify(makeUser([account]))
+    });
+    const urls = [];
+    globalThis.fetch = async (url) => {
+      urls.push(String(url));
+      return new Response(JSON.stringify({
+        error: { code: 429, message: "Resource has been exhausted (e.g. check quota).", status: "RESOURCE_EXHAUSTED" }
+      }), {
+        status: 429,
+        headers: { "Content-Type": "application/json" }
+      });
+    };
+    const ctx = makeCtx();
+    const response = await worker.fetch(apiRequest(), { GEMINI_KV: kv }, ctx);
+    const text = await response.text();
+    await ctx.drain();
+
+    const generationCalls = urls.filter((url) => /:generateContent|:streamGenerateContent/.test(url));
+    const quotaProbes = urls.filter((url) => /loadCodeAssist|fetchAvailableModels|retrieveUserQuotaSummary/.test(url));
+    if (response.status !== 429 || !text.includes("RESOURCE_EXHAUSTED")) {
+      throw new Error(`cold-cache 429 must reach the client: HTTP ${response.status} ${text}`);
+    }
+    if (quotaProbes.length !== 0) {
+      throw new Error(`cold quota cache must not trigger a refresh: ${JSON.stringify(quotaProbes)}`);
+    }
+    if (generationCalls.length !== 9) {
+      throw new Error(`cold-cache 429 must keep the 3 x 3 attempt budget: ${generationCalls.length} generation calls`);
+    }
+    console.log("PASS: cold quota cache skips the quota refresh during 429 recovery");
   }
 } finally {
   globalThis.fetch = originalFetch;

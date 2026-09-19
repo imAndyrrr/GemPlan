@@ -15,10 +15,13 @@ const code = `
 const __name = (f) => f; const __name2 = (f) => f;
 const deriveSessionId = () => "";
 ${extract("extractThinkingParams")}
+${extract("getUpstreamThinkingConfig")}
 globalThis.__fn = extractThinkingParams;
+globalThis.__thinking = getUpstreamThinkingConfig;
 `;
 new Function(code)();
 const extractThinkingParams = globalThis.__fn;
+const getUpstreamThinkingConfig = globalThis.__thinking;
 
 const body = { model: "gemini-2.5-flash", reasoning_effort: "high", messages: [] };
 const p1 = extractThinkingParams(body);
@@ -30,3 +33,6 @@ const serialized = JSON.stringify({ request: body });
 if (serialized.includes("__thinkingParams")) throw new Error("cache leaked into JSON payload");
 console.log("PASS: cache works, non-enumerable, JSON payload clean");
 console.log("serialized:", serialized);
+const disabled = getUpstreamThinkingConfig({ model: "gemini-2.5-flash", reasoning_effort: "none" }, "gemini-2.5-flash", "openai");
+if (disabled !== undefined) throw new Error(`reasoning_effort=none still emits thinking config: ${JSON.stringify(disabled)}`);
+console.log("PASS: disabled reasoning omits Antigravity thinkingConfig");

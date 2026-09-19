@@ -307,6 +307,44 @@ function collectAllDefs(schema) {
 }
 __name(collectAllDefs, "collectAllDefs");
 __name2(collectAllDefs, "collectAllDefs");
+// Folding a `$ref` branch (or collapsing an `anyOf` branch) into its placeholder
+// node must COMBINE the object keywords, not let the outer node overwrite the
+// branch. A schema like
+//   {type:"object", properties:{}, anyOf:[{properties:{threadId}, required:["threadId"]}]}
+// used to collapse into `{type:"OBJECT", properties:{}, required:["threadId"]}`:
+// a required name with no property definition. Antigravity/Gemini rejects the
+// entire request for that (observed as 429 RESOURCE_EXHAUSTED on the agent
+// endpoint, which is the "format" failure rather than a quota failure), so merge
+// `properties` and union `required` here and never drop the branch definitions.
+function mergeResolvedSchema(schema, resolved, skipKeys) {
+  const outer = {};
+  for (const key of Object.keys(schema)) {
+    if (!skipKeys.includes(key)) outer[key] = schema[key];
+  }
+  const outerProperties = outer.properties;
+  const outerRequired = outer.required;
+  delete outer.properties;
+  delete outer.required;
+  for (const key of Object.keys(schema)) {
+    delete schema[key];
+  }
+  Object.assign(schema, resolved, outer);
+  if (outerProperties && typeof outerProperties === "object" && !Array.isArray(outerProperties)) {
+    const branchProperties = schema.properties && typeof schema.properties === "object" && !Array.isArray(schema.properties) ? schema.properties : {};
+    schema.properties = { ...branchProperties, ...outerProperties };
+  }
+  const mergedRequired = [];
+  for (const list of [schema.required, outerRequired]) {
+    if (!Array.isArray(list)) continue;
+    for (const name of list) {
+      if (typeof name === "string" && !mergedRequired.includes(name)) mergedRequired.push(name);
+    }
+  }
+  if (mergedRequired.length > 0) schema.required = mergedRequired;
+  else delete schema.required;
+}
+__name(mergeResolvedSchema, "mergeResolvedSchema");
+__name2(mergeResolvedSchema, "mergeResolvedSchema");
 function optimizeAndCleanSchema(schema, needsUppercase, defs = null, depth = 0, seenRefs = null) {
   if (!schema || typeof schema !== "object" || depth > 20) return;
   if (defs === null) {
@@ -327,14 +365,7 @@ function optimizeAndCleanSchema(schema, needsUppercase, defs = null, depth = 0, 
         return;
       }
       const resolved = structuredClone(defs[refName]);
-      const extra = {};
-      for (const k of Object.keys(schema)) {
-        if (k !== "$ref") extra[k] = schema[k];
-      }
-      for (const k of Object.keys(schema)) {
-        delete schema[k];
-      }
-      Object.assign(schema, resolved, extra);
+      mergeResolvedSchema(schema, resolved, ["$ref"]);
       seenRefs.add(refName);
       optimizeAndCleanSchema(schema, needsUppercase, defs, depth + 1, seenRefs);
       seenRefs.delete(refName);
@@ -395,14 +426,7 @@ function optimizeAndCleanSchema(schema, needsUppercase, defs = null, depth = 0, 
           }
         }
         const resolved = structuredClone(firstValid);
-        const extra = {};
-        for (const k of Object.keys(schema)) {
-          if (k !== "anyOf") extra[k] = schema[k];
-        }
-        for (const k of Object.keys(schema)) {
-          delete schema[k];
-        }
-        Object.assign(schema, resolved, extra);
+        mergeResolvedSchema(schema, resolved, ["anyOf"]);
       }
     }
   }
@@ -455,6 +479,16 @@ function optimizeAndCleanSchema(schema, needsUppercase, defs = null, depth = 0, 
         if (item && typeof item === "object") optimizeAndCleanSchema(item, needsUppercase, defs, depth + 1, seenRefs);
       }
     }
+  }
+  // Last-resort guard for every merge path: Gemini rejects a declaration that
+  // lists `required` names which are missing from its sibling `properties`, and
+  // the Antigravity agent endpoint reports that as 429 RESOURCE_EXHAUSTED. Only
+  // dangling names are removed; no property is ever added, renamed, or reordered.
+  if (Array.isArray(schema.required) && schema.properties && typeof schema.properties === "object" && !Array.isArray(schema.properties)) {
+    const properties = schema.properties;
+    const defined = schema.required.filter((name) => typeof name === "string" && Object.prototype.hasOwnProperty.call(properties, name));
+    if (defined.length === 0) delete schema.required;
+    else if (defined.length !== schema.required.length) schema.required = defined;
   }
 }
 __name(optimizeAndCleanSchema, "optimizeAndCleanSchema");
@@ -628,10 +662,49 @@ __name2(normalizeToolHistoryIdentities, "normalizeToolHistoryIdentities");
 // walked once to detect calls, once to clone/inject signatures, and once again
 // to normalize IDs. This helper keeps the exact same output while avoiding two
 // full extra walks over the history on tool turns.
-function prepareAntigravityContents(contents, cachedSignature, includeThinking) {
+function prepareAntigravityContents(contents, cachedSignature, includeThinking, mutateInPlace = false) {
   if (!Array.isArray(contents) || contents.length === 0) return contents || [];
   const callCounts = new Map();
   const pendingByOriginalId = new Map();
+  if (mutateInPlace) {
+    for (const content of contents) {
+      const parts = Array.isArray(content?.parts) ? content.parts : [];
+      for (const part of parts) {
+        const functionCall = part?.functionCall;
+        if (functionCall) {
+          const originalId = functionCall.id;
+          let normalizedId = originalId;
+          if (originalId) {
+            const occurrence = (callCounts.get(originalId) || 0) + 1;
+            callCounts.set(originalId, occurrence);
+            normalizedId = occurrence === 1 ? originalId : `${originalId}__dup${occurrence}`;
+            if (normalizedId !== originalId) functionCall.id = normalizedId;
+            let pending = pendingByOriginalId.get(originalId);
+            if (!pending) {
+              pending = { calls: [], next: 0 };
+              pendingByOriginalId.set(originalId, pending);
+            }
+            pending.calls.push({ id: normalizedId, name: functionCall.name });
+          }
+          const signature = part.thoughtSignature || part.thought_signature || cachedSignature || "skip_thought_signature_validator";
+          part.thoughtSignature = signature;
+          part.thought_signature = signature;
+        }
+        const functionResponse = part?.functionResponse;
+        if (functionResponse?.id) {
+          const originalId = functionResponse.id;
+          const pending = pendingByOriginalId.get(originalId);
+          if (pending && pending.next < pending.calls.length) {
+            const matchingCall = pending.calls[pending.next++];
+            functionResponse.id = matchingCall.id;
+            if (matchingCall.name) functionResponse.name = matchingCall.name;
+            if (pending.next === pending.calls.length) pendingByOriginalId.delete(originalId);
+          }
+        }
+      }
+    }
+    return contents;
+  }
   const prepared = new Array(contents.length);
   for (let contentIndex = 0; contentIndex < contents.length; contentIndex++) {
     const content = contents[contentIndex];
@@ -918,15 +991,24 @@ function cloneTransientValue(value) {
   return structuredClone(value);
 }
 __name(cloneTransientValue, "cloneTransientValue");
-async function getTransientJsonCache(namespace, key, ttlSeconds = 7200) {
+// 同步读取 isolate 内存缓存。用于主路径上“有则更好、没有就按未知处理”的读取：
+// 命中时零 I/O，未命中不再去问 Cache API / KV。Cache API 与 KV 都是网络往返，
+// 放在请求关键路径上会直接增加延迟和 CPU。
+function readTransientJsonCacheSync(namespace, key) {
   const memoryKey = transientCacheKey(namespace, key);
   const memoryEntry = transientJsonCache.get(memoryKey);
-  if (memoryEntry) {
-    if (memoryEntry.expiresAt > Date.now()) {
-      return cloneTransientValue(memoryEntry.value);
-    }
-    transientJsonCache.delete(memoryKey);
+  if (!memoryEntry) return null;
+  if (memoryEntry.expiresAt > Date.now()) {
+    return cloneTransientValue(memoryEntry.value);
   }
+  transientJsonCache.delete(memoryKey);
+  return null;
+}
+__name(readTransientJsonCacheSync, "readTransientJsonCacheSync");
+__name2(readTransientJsonCacheSync, "readTransientJsonCacheSync");
+async function getTransientJsonCache(namespace, key, ttlSeconds = 7200) {
+  const memoryValue = readTransientJsonCacheSync(namespace, key);
+  if (memoryValue !== null) return memoryValue;
   if (typeof caches !== "undefined" && caches.default) {
     try {
       const response = await caches.default.match(transientCacheRequest(namespace, key));
@@ -1056,19 +1138,11 @@ function getUpstreamThinkingConfig(body, resolvedModel, apiType) {
   const { thinkingBudget, thinkingLevel, reasoningEffort, thinkingObj, rawThinkingConfig, outputConfig } = extractThinkingParams(body);
   const clientExplicitlyDisabled = thinkingObj?.type === "disabled" || thinkingObj?.budget_tokens === 0 || outputConfig?.effort === "none" || reasoningEffort === "none" || thinkingBudget === 0 || thinkingLevel !== void 0 && (thinkingLevel === "MINIMAL" || thinkingLevel === "minimal") || rawThinkingConfig?.thinkingBudget === 0 || rawThinkingConfig?.thinkingLevel !== void 0 && (rawThinkingConfig.thinkingLevel === "MINIMAL" || rawThinkingConfig.thinkingLevel === "minimal");
   if (clientExplicitlyDisabled) {
-    if (apiType === "openai") {
-      if (isGemini25) {
-        return { thinkingBudget: 0 };
-      } else {
-        return { thinkingLevel: "MINIMAL" };
-      }
-    } else {
-      if (isGemini25) {
-        return { thinkingBudget: 0 };
-      } else {
-        return { thinkingLevel: "MINIMAL" };
-      }
-    }
+    // Antigravity 的 agent API 不接受 Gemini 原生的禁用值
+    // `thinkingBudget: 0` / `thinkingLevel: MINIMAL`，会把最简单的请求也判为
+    // INVALID_ARGUMENT。OpenAI 客户端的 `reasoning_effort: none` 本意是“不启用
+    // 思考”，因此直接省略 thinkingConfig，由上游使用普通生成路径。
+    return void 0;
   }
   const clientWantsThinking = thinkingObj?.type === "enabled" || thinkingObj?.type === "adaptive" || thinkingObj?.budget_tokens !== void 0 && thinkingObj.budget_tokens > 0 || (thinkingObj?.effort_level !== void 0 || thinkingObj?.effortLevel !== void 0 || thinkingObj?.effort !== void 0) || outputConfig?.effort !== void 0 && outputConfig.effort !== "none" || reasoningEffort !== void 0 && reasoningEffort !== "none" || thinkingBudget !== void 0 || thinkingLevel !== void 0 || rawThinkingConfig?.thinkingBudget !== void 0 || rawThinkingConfig?.thinkingLevel !== void 0;
   if (!clientWantsThinking) {
@@ -1212,99 +1286,185 @@ function mapTools(body, apiType, needsUppercase = true, preserveDraft2020 = fals
 }
 __name(mapTools, "mapTools");
 __name2(mapTools, "mapTools");
-// Normalize the OpenAI Responses envelope into the Chat Completions-shaped
-// messages consumed by the existing Gemini/Claude conversion path.
-function responseInputContentToChat(content) {
-  if (typeof content === "string") return content;
-  if (!Array.isArray(content)) return content;
-  return content.map((item) => {
-    if (!item || typeof item !== "object") return item;
-    if (item.type === "input_text" || item.type === "output_text") {
-      return { ...item, type: "text" };
+// The Responses endpoint is the hot path for Codex.  Converting Responses to
+// Chat messages and then converting those messages to Gemini contents makes a
+// large request walk its entire history twice and allocates a second envelope
+// for every content block.  Keep the public protocol unchanged, but build the
+// final Gemini contents in one pass over the content blocks instead.
+function responseContentToGeminiParts(content, parts) {
+  if (typeof content === "string") {
+    if (hasNonWhitespace(content)) parts.push({ text: content });
+    return;
+  }
+  if (!Array.isArray(content)) return;
+  for (const block of content) {
+    if (!block || typeof block !== "object") continue;
+    const type = String(block.type || "").toLowerCase();
+    if (type === "text" || type === "input_text" || type === "output_text") {
+      if (typeof block.text === "string" && hasNonWhitespace(block.text)) {
+        parts.push({ text: block.text });
+      }
+      continue;
     }
-    if (item.type === "input_image") {
-      const imageUrl = item.image_url || item.imageUrl;
-      return {
-        ...item,
-        type: "image_url",
-        image_url: typeof imageUrl === "string" ? imageUrl : imageUrl?.url || imageUrl
-      };
+    if (type !== "image" && type !== "image_url" && type !== "input_image") continue;
+    const source = block.source;
+    if (source && typeof source === "object" && source.data) {
+      parts.push({
+        inlineData: {
+          mimeType: source.media_type || "image/png",
+          data: source.data
+        }
+      });
+      continue;
     }
-    return item;
-  });
+    const rawUrl = typeof block.image_url === "string"
+      ? block.image_url
+      : block.image_url?.url || block.url;
+    if (!rawUrl || typeof rawUrl !== "string") continue;
+    if (rawUrl.startsWith("data:")) {
+      const commaIndex = rawUrl.indexOf(",");
+      if (commaIndex === -1) continue;
+      const semiIndex = rawUrl.indexOf(";");
+      parts.push({
+        inlineData: {
+          mimeType: semiIndex > 5 ? rawUrl.substring(5, semiIndex) : "image/png",
+          data: rawUrl.substring(commaIndex + 1)
+        }
+      });
+    } else {
+      parts.push({
+        fileData: {
+          fileUri: rawUrl,
+          mimeType: block.media_type || block.mime_type || "image/png"
+        }
+      });
+    }
+  }
 }
-__name(responseInputContentToChat, "responseInputContentToChat");
-__name2(responseInputContentToChat, "responseInputContentToChat");
-function responseOutputToChatText(output) {
+__name(responseContentToGeminiParts, "responseContentToGeminiParts");
+__name2(responseContentToGeminiParts, "responseContentToGeminiParts");
+function responseOutputToGeminiText(output) {
   if (typeof output === "string") return output;
   if (output == null) return "";
   return typeof output === "object" ? JSON.stringify(output) : String(output);
 }
-__name(responseOutputToChatText, "responseOutputToChatText");
-__name2(responseOutputToChatText, "responseOutputToChatText");
-function responsesInputToChatMessages(input) {
-  if (typeof input === "string") return [{ role: "user", content: input }];
-  if (!Array.isArray(input)) return [];
-  const messages = [];
-  const topLevelContent = [];
+__name(responseOutputToGeminiText, "responseOutputToGeminiText");
+__name2(responseOutputToGeminiText, "responseOutputToGeminiText");
+function responsesRequestToGeminiRequest(body) {
+  const contents = [];
+  const functionNames = new Map();
+  const pendingFunctionResponses = new Map();
+  const input = Array.isArray(body?.input) ? body.input : [];
+  let contentsHaveFunctionCalls = false;
+  const appendParts = (role, parts, forceSeparate = false) => {
+    if (!parts || parts.length === 0) return;
+    const previous = contents[contents.length - 1];
+    if (!forceSeparate && previous?.role === role) {
+      previous.parts.push(...parts);
+    } else {
+      contents.push({ role, parts });
+    }
+  };
+  let systemInstructionText = "";
+  if (typeof body?.instructions === "string") {
+    systemInstructionText = body.instructions;
+  } else if (Array.isArray(body?.instructions)) {
+    const instructionParts = [];
+    for (const item of body.instructions) {
+      if (typeof item === "string") {
+        if (hasNonWhitespace(item)) instructionParts.push(item);
+      } else if (item?.type === "message" || item?.role) {
+        const messageParts = [];
+        responseContentToGeminiParts(item.content, messageParts);
+        for (const part of messageParts) {
+          if (part.text) instructionParts.push(part.text);
+        }
+      } else {
+        const itemParts = [];
+        responseContentToGeminiParts([item], itemParts);
+        for (const part of itemParts) {
+          if (part.text) instructionParts.push(part.text);
+        }
+      }
+    }
+    systemInstructionText = instructionParts.join("\n\n");
+  }
   for (const item of input) {
     if (!item || typeof item !== "object") {
-      if (typeof item === "string") topLevelContent.push({ type: "text", text: item });
+      if (typeof item === "string") appendParts("user", [{ text: item }]);
       continue;
     }
     if (item.type === "function_call") {
-      messages.push({
-        role: "assistant",
-        content: null,
-        tool_calls: [{
-          id: item.call_id || item.id || `call_${generateRandomString(8)}`,
-          type: "function",
-          function: {
-            name: item.name || "unknown",
-            arguments: typeof item.arguments === "string" ? item.arguments : JSON.stringify(item.arguments || {})
-          }
-        }]
-      });
+      contentsHaveFunctionCalls = true;
+      let args = {};
+      if (typeof item.arguments === "string") {
+        try {
+          args = JSON.parse(item.arguments);
+        } catch (_) {
+        }
+      } else if (item.arguments && typeof item.arguments === "object") {
+        args = item.arguments;
+      }
+      const toolIdentity = decodeToolCallIdentity(item.call_id || item.id || "");
+      const rawId = item.call_id || item.id || "";
+      const functionName = item.name || "unknown";
+      if (rawId) functionNames.set(rawId, functionName);
+      if (toolIdentity.id) functionNames.set(toolIdentity.id, functionName);
+      // Responses normally places the call before its output, but preserve
+      // correct names even when a client sends the pair out of order.
+      for (const responsePart of pendingFunctionResponses.get(toolIdentity.id) || []) {
+        responsePart.functionResponse.name = functionName;
+      }
+      pendingFunctionResponses.delete(toolIdentity.id);
+      const functionPart = {
+        functionCall: {
+          name: functionName,
+          args,
+          id: toolIdentity.id
+        }
+      };
+      // Gemini signatures belong to Part, not the nested FunctionCall.
+      // Restore them before preparation so the real signature wins over cache.
+      if (toolIdentity.thoughtSignature) {
+        functionPart.thoughtSignature = toolIdentity.thoughtSignature;
+        functionPart.thought_signature = toolIdentity.thoughtSignature;
+      }
+      appendParts("model", [functionPart]);
       continue;
     }
     if (item.type === "function_call_output") {
-      messages.push({
-        role: "tool",
-        tool_call_id: item.call_id || item.id || "",
-        content: responseOutputToChatText(item.output)
-      });
+      const toolIdentity = decodeToolCallIdentity(item.call_id || item.id || "");
+      const id = toolIdentity.id;
+      const functionResponse = {
+        functionResponse: {
+          name: functionNames.get(id) || "unknown",
+          response: { result: responseOutputToGeminiText(item.output) },
+          id
+        }
+      };
+      if (!functionNames.has(id)) {
+        const pending = pendingFunctionResponses.get(id);
+        if (pending) pending.push(functionResponse);
+        else pendingFunctionResponses.set(id, [functionResponse]);
+      }
+      appendParts("user", [functionResponse], true);
       continue;
     }
     if (item.type === "message" || item.role) {
-      const role = ["developer", "system", "assistant", "tool"].includes(item.role) ? item.role : "user";
-      messages.push({ role, content: responseInputContentToChat(item.content) });
+      const role = item.role === "assistant" ? "model" : item.role === "system" || item.role === "developer" ? null : "user";
+      if (!role) continue;
+      const parts = [];
+      responseContentToGeminiParts(item.content, parts);
+      appendParts(role, parts, item.role === "tool");
       continue;
     }
     if (item.type === "input_text" || item.type === "output_text" || item.type === "input_image") {
-      topLevelContent.push(responseInputContentToChat(item));
+      const parts = [];
+      responseContentToGeminiParts([item], parts);
+      appendParts("user", parts);
     }
   }
-  if (topLevelContent.length > 0) messages.push({ role: "user", content: topLevelContent });
-  return messages;
-}
-__name(responsesInputToChatMessages, "responsesInputToChatMessages");
-__name2(responsesInputToChatMessages, "responsesInputToChatMessages");
-function responsesRequestToChatRequest(body) {
-  const messages = [];
-  if (typeof body.instructions === "string" && body.instructions.trim()) {
-    messages.push({ role: "system", content: body.instructions });
-  } else if (Array.isArray(body.instructions)) {
-    const instructionMessages = responsesInputToChatMessages(body.instructions);
-    if (instructionMessages.length > 0) {
-      for (const message of instructionMessages) {
-        messages.push({ ...message, role: "developer" });
-      }
-    } else {
-      messages.push({ role: "developer", content: responseInputContentToChat(body.instructions) });
-    }
-  }
-  messages.push(...responsesInputToChatMessages(body.input));
-  const tools = Array.isArray(body.tools) ? body.tools.flatMap((tool) => {
+  const normalizedTools = Array.isArray(body?.tools) ? body.tools.flatMap((tool) => {
     if (!tool || tool.type !== "function") return [];
     return [{
       type: "function",
@@ -1316,33 +1476,33 @@ function responsesRequestToChatRequest(body) {
       }
     }];
   }) : void 0;
-  const textFormat = body.text?.format;
-  let responseFormat = void 0;
-  if (textFormat?.type === "json_object") {
-    responseFormat = { type: "json_object" };
-  } else if (textFormat?.type === "json_schema") {
-    responseFormat = {
-      type: "json_schema",
-      json_schema: {
-        name: textFormat.name || "response",
-        schema: textFormat.schema || {},
-        strict: textFormat.strict !== false
-      }
-    };
-  }
   return {
-    ...body,
-    messages,
-    tools,
-    max_tokens: body.max_output_tokens ?? body.max_tokens,
-    response_format: responseFormat,
-    reasoning_effort: body.reasoning?.effort || body.reasoning?.effort_level,
-    reasoning: body.reasoning,
-    prompt_cache_key: body.prompt_cache_key || body.promptCacheKey || body.previous_response_id
+    contents,
+    systemInstructionText,
+    toolsBody: { tools: normalizedTools },
+    temperature: body?.temperature,
+    topP: body?.top_p,
+    maxOutputTokens: body?.max_output_tokens ?? body?.max_tokens,
+    responseFormat: body?.text?.format
+      ? body.text.format.type === "json_object"
+        ? { type: "json_object" }
+        : body.text.format.type === "json_schema"
+          ? {
+            type: "json_schema",
+            json_schema: {
+              name: body.text.format.name || "response",
+              schema: body.text.format.schema || {},
+              strict: body.text.format.strict !== false
+            }
+          }
+          : void 0
+      : void 0,
+    messageCount: input.length || 1,
+    contentsHaveFunctionCalls
   };
 }
-__name(responsesRequestToChatRequest, "responsesRequestToChatRequest");
-__name2(responsesRequestToChatRequest, "responsesRequestToChatRequest");
+__name(responsesRequestToGeminiRequest, "responsesRequestToGeminiRequest");
+__name2(responsesRequestToGeminiRequest, "responsesRequestToGeminiRequest");
 function getOpenAIToolConfig(body) {
   const choice = body?.tool_choice;
   if (choice === "none") {
@@ -1477,9 +1637,12 @@ async function callUpstream(method, requestHeaders, payload, isStream, serialize
   const baseUrls = isCodeAssist ? [
     "https://cloudcode-pa.googleapis.com/v1internal"
   ] : [
-    "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal",
+    // Antigravity quota/429 responses are account-wide, not endpoint-specific.
+    // Start with production so an exhausted sandbox does not add two serial
+    // network waits before the client sees the real upstream status.
+    "https://cloudcode-pa.googleapis.com/v1internal",
     "https://daily-cloudcode-pa.googleapis.com/v1internal",
-    "https://cloudcode-pa.googleapis.com/v1internal"
+    "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal"
   ];
   let hasTriggeredDowngrade = false;
   let headersCopy = { ...requestHeaders };
@@ -1516,9 +1679,11 @@ async function callUpstream(method, requestHeaders, payload, isStream, serialize
           shouldRetryWithoutHeader = true;
           break;
         }
-        // 400 (INVALID_ARGUMENT) 也会偶发出现于 Antigravity agent API。
-        // 对于 403 Forbidden（如 sandbox 权限拦截或订阅限制），如果有后续端点，也允许回退到生产端点。
-        const isRetryable = status === 429 || status === 408 || status === 404 || status === 400 || status === 403 || status >= 500;
+        // 400 (INVALID_ARGUMENT) 是确定性的：同一个请求体换端点、换账号都会同样
+        // 失败，所以它既不再换端点，也不在下面重试（一次请求只多花一次调用就能
+        // 把上游的真实报错交给客户端）。429/408/404/403 与 5xx 仍可换端点，因为
+        // 它们可能只是 sandbox 端点限流、订阅限制或方法缺失。
+        const isRetryable = status === 429 || status === 408 || status === 404 || status === 403 || status >= 500;
         if (hasNext && isRetryable) {
           if (response.body) {
             await response.body.cancel();
@@ -2534,6 +2699,7 @@ async function handleDashboard(request, env) {
                   <span class="${acc.mode === 'antigravity' ? 'tag-ag' : 'tag-ca'}">${acc.mode === 'antigravity' ? 'Antigravity' : 'CodeAssist'}</span>
                   <span style="font-weight:bold; font-size:14px; color:#212529;">${escapeHtml(acc.email || 'Google \u8D26\u53F7')}</span>
                   ${acc.name ? `<span style="font-size:12px; color:#6c757d;">(${escapeHtml(acc.name)})</span>` : ''}
+                  <span style="font-size:11px; color:#495057; background:#e9ecef; border-radius:3px; padding:1px 5px;">优先级 ${Math.min(100, Math.max(0, Number.isFinite(Number(acc.priority)) ? Number(acc.priority) : 0))}</span>
                 </div>
                 <div style="font-size:12px; color:#6c757d;">
                   \u72B6\u6001: ${statusBadge}
@@ -2541,7 +2707,11 @@ async function handleDashboard(request, env) {
                   ${acc.error_message ? ` \u00B7 <span style="color:#dc3545;">${escapeHtml(acc.error_message)}</span>` : ''}
                 </div>
               </div>
-              <div style="display:flex; gap:6px;">
+              <div style="display:flex; gap:6px; align-items:center; flex-wrap:wrap;">
+                <label style="font-size:12px; color:#495057; display:flex; align-items:center; gap:4px; margin:0;">
+                  优先级
+                  <input type="number" min="0" max="100" step="1" value="${Math.min(100, Math.max(0, Number.isFinite(Number(acc.priority)) ? Number(acc.priority) : 0))}" onchange="setAccountPriority('${acc.id}', this.value)" style="width:58px; padding:4px 6px; margin:0; font-size:12px;">
+                </label>
                 <button class="btn-sm" onclick="toggleAccount('${acc.id}', ${acc.enabled === false})" style="background:${acc.enabled !== false ? '#6c757d' : '#28a745'};">${acc.enabled !== false ? '\u7981\u7528' : '\u542F\u7528'}</button>
                 ${isCooling ? `<button class="btn-sm" onclick="resetAccountCooldown('${acc.id}')" style="background:#fd7e14;">\u89E3\u9664\u51B7\u5374</button>` : ''}
                 <button class="btn-sm" onclick="deleteAccount('${acc.id}')" style="background:#dc3545;">\u5220\u9664</button>
@@ -2774,6 +2944,27 @@ async function handleDashboard(request, env) {
           else alert("\u64CD\u4F5C\u5931\u8D25: " + (d.error || "\u672A\u77E5\u9519\u8BEF"));
         } catch (e) {
           alert("\u8BF7\u6C42\u5931\u8D25: " + e.message);
+        }
+      }
+
+      async function setAccountPriority(id, value) {
+        const priority = Number(value);
+        if (!Number.isInteger(priority) || priority < 0 || priority > 100) {
+          alert("优先级必须是 0 到 100 之间的整数");
+          window.location.reload();
+          return;
+        }
+        try {
+          const res = await fetch("/api/user/account", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ action: "set_priority", id, priority })
+          });
+          const d = await res.json();
+          if (d.success) window.location.reload();
+          else alert("设置优先级失败: " + (d.error || "未知错误"));
+        } catch (e) {
+          alert("请求失败: " + e.message);
         }
       }
 
@@ -3078,6 +3269,7 @@ function getUserAccounts(user) {
         enabled: true,
         created_at: Math.floor(Date.now() / 1e3),
         last_used_at: 0,
+        priority: 0,
         status: "active",
         cooldown_until: 0,
         error_message: null
@@ -3096,6 +3288,7 @@ function getUserAccounts(user) {
         enabled: true,
         created_at: Math.floor(Date.now() / 1e3),
         last_used_at: 0,
+        priority: 0,
         status: "active",
         cooldown_until: 0,
         error_message: null
@@ -3278,31 +3471,24 @@ __name2(ensureValidAccountToken, "ensureValidAccountToken");
 async function rankAccountsForRequest(accounts, resolvedModel, username, env) {
   if (!Array.isArray(accounts) || accounts.length === 0) return [];
   if (accounts.length === 1) return accounts.slice();
+  const getAccountPriority = (account) => Math.min(100, Math.max(0, Number.isFinite(Number(account?.priority)) ? Number(account.priority) : 0));
   const now = Math.floor(Date.now() / 1e3);
   const scored = [];
   const quotaByAccountId = /* @__PURE__ */ new Map();
   const cooldownByAccountId = await getAccountCooldowns(accounts, username);
 
-  // Bulk KV reads turn N sequential quota lookups into one operation for up to
-  // 100 accounts. If KV is temporarily unavailable, all quotas remain
-  // "unknown" and the existing status/LRU rules still provide safe routing.
+  // 配额只写入 isolate 内存 + Cache API（见 putTransientJsonCache），KV 从来不是
+  // 配额的存储层，`quota:` KV 键只会被删除、不会被写入。因此这里改读同步内存缓存：
+  // 命中就是本 isolate 最近一次配额刷新的结果，未命中即“未知配额”，与旧行为等价，
+  // 但省掉了每个多账号请求一次的 KV 批量网络读。
   const quotaAccounts = accounts.filter((acc) =>
     acc.mode === "antigravity" &&
     !(Math.max(Number(acc.cooldown_until) || 0, cooldownByAccountId.get(acc.id) || 0) > now) &&
     acc.status !== "error"
   );
-  if (quotaAccounts.length > 0 && env?.GEMINI_KV) {
-    try {
-      for (let offset = 0; offset < quotaAccounts.length; offset += 100) {
-        const chunk = quotaAccounts.slice(offset, offset + 100);
-        const keys = chunk.map((acc) => `quota:${username}:${acc.id}`);
-        const values = await env.GEMINI_KV.get(keys, "json");
-        for (let i = 0; i < chunk.length; i++) {
-          const value = values instanceof Map ? values.get(keys[i]) : null;
-          if (value) quotaByAccountId.set(chunk[i].id, value);
-        }
-      }
-    } catch (_) {}
+  for (const acc of quotaAccounts) {
+    const value = readTransientJsonCacheSync("quota-account", `quota:${username}:${acc.id}`);
+    if (value) quotaByAccountId.set(acc.id, value);
   }
 
   for (const acc of accounts) {
@@ -3332,11 +3518,15 @@ async function rankAccountsForRequest(accounts, resolvedModel, username, env) {
     }
 
     const lastUsed = getEffectiveLastUsed(username, acc);
-    scored.push({ account: acc, score, lastUsed });
+    const priority = getAccountPriority(acc);
+    // Healthy/available accounts should always be selected before cooling/error accounts,
+    // even if the cooling account has a nominally higher manual priority.
+    const isAvailable = score > 0 ? 1 : 0;
+    scored.push({ account: acc, score, lastUsed, priority, isAvailable });
   }
 
-  // Quota/status is authoritative; exact LRU only breaks equal-score ties.
-  scored.sort((a, b) => b.score - a.score || a.lastUsed - b.lastUsed);
+  // Availability first, then manual priority tier, then quota/status score, then LRU tie-breaker.
+  scored.sort((a, b) => b.isAvailable - a.isAvailable || b.priority - a.priority || b.score - a.score || a.lastUsed - b.lastUsed);
   return scored.map((s) => s.account);
 }
 __name(rankAccountsForRequest, "rankAccountsForRequest");
@@ -3363,7 +3553,8 @@ async function handleAccountApi(request, env, ctx) {
         cooldown_until: Math.max(Number(a.cooldown_until) || 0, transientCooldownByAccountId.get(a.id) || 0),
         last_used_at: getEffectiveLastUsed(username, a),
         created_at: a.created_at || 0,
-        error_message: a.error_message || null
+        error_message: a.error_message || null,
+        priority: Math.min(100, Math.max(0, Number.isFinite(Number(a.priority)) ? Number(a.priority) : 0))
       }))
     });
   }
@@ -3402,6 +3593,18 @@ async function handleAccountApi(request, env, ctx) {
       ctx.waitUntil(env.GEMINI_KV.delete(`quota:${username}:antigravity`));
       await saveUser(env, user, username);
       return jsonResponse({ success: true, enabled: targetAccount.enabled });
+    }
+
+    if (action === "set_priority") {
+      if (!targetAccount) return jsonResponse({ error: "Account not found" }, 404);
+      const priority = Number(payload.priority);
+      if (!Number.isInteger(priority) || priority < 0 || priority > 100) {
+        return jsonResponse({ error: "Priority must be an integer from 0 to 100" }, 400);
+      }
+      targetAccount.priority = priority;
+      ctx.waitUntil(env.GEMINI_KV.delete(`quota:${username}:antigravity`));
+      await saveUser(env, user, username);
+      return jsonResponse({ success: true, priority });
     }
 
     if (action === "rename") {
@@ -3548,6 +3751,7 @@ async function handleGoogleCallback(request, env, ctx) {
       enabled: true,
       created_at: Math.floor(Date.now() / 1e3),
       last_used_at: 0,
+      priority: 0,
       status: "active",
       cooldown_until: 0,
       error_message: null
@@ -3779,7 +3983,7 @@ function inferModelQuotaWindow(model, quotaGroups) {
 __name(inferModelQuotaWindow, "inferModelQuotaWindow");
 __name2(inferModelQuotaWindow, "inferModelQuotaWindow");
 
-async function fetchAccountAntigravityQuotaData(account, username, env, ctx, forceRefresh) {
+async function fetchAccountAntigravityQuotaData(account, username, env, ctx, forceRefresh, cacheOnly = false) {
   const tokens = account?.tokens;
   if (!tokens || !tokens.access_token) {
     return { error: "\u8D26\u53F7\u7F3A\u5C11\u6709\u6548\u51ED\u8BC1", status: 400 };
@@ -3796,6 +4000,11 @@ async function fetchAccountAntigravityQuotaData(account, username, env, ctx, for
     );
     if (cached && cached.last_updated) {
       return { data: cached };
+    }
+    // cacheOnly：调用方只想要“手头已有的配额信息”。冷缓存时直接返回“没有”，
+    // 不去补打上游配额接口，也不写缓存（避免在失败的请求里制造额外上游调用）。
+    if (cacheOnly) {
+      return { data: null };
     }
   }
   let { access_token, refresh_token, expires_at } = tokens;
@@ -4264,13 +4473,16 @@ async function handleApiProxy(request, env, ctx, customPath, apiType) {
   } catch (e) {
     return jsonResponse({ error: "Invalid JSON payload" }, 400);
   }
+  let responseFastPath = null;
   if (responseProtocol) {
-    body = responsesRequestToChatRequest(body || {});
+    // Avoid materializing an intermediate Chat-shaped copy of a large
+    // Responses history. The fast path below builds Gemini contents directly.
+    responseFastPath = responsesRequestToGeminiRequest(body || {});
     apiType = "openai";
   }
   const geminiRoute = apiType === "gemini" ? getGeminiRouteInfo(request) : null;
   const inputModel = body.model || geminiRoute?.model || "gemini-3-flash-preview";
-  if ((apiType === "openai" || apiType === "claude") && !Array.isArray(body.messages)) {
+  if ((apiType === "openai" || apiType === "claude") && !responseFastPath && !Array.isArray(body.messages)) {
     return jsonResponse({ error: "`messages` must be an array" }, 400);
   }
   if (apiType === "gemini" && !Array.isArray(body.contents)) {
@@ -4278,7 +4490,7 @@ async function handleApiProxy(request, env, ctx, customPath, apiType) {
   }
   const sessionKey = getRequestSessionKey(body, request);
   const sessionId = deriveSessionId(`${username || "anonymous"}\u0000${inputModel}\u0000${sessionKey}`);
-  const messageCount = body.messages ? body.messages.length : 1;
+  const messageCount = responseFastPath?.messageCount || (body.messages ? body.messages.length : 1);
   const caPattern = user.api_config.codeassist_pattern || "{modelname}";
   const antigravity_pattern = user.api_config.antigravity_pattern || "{modelname}-agy";
   let mode = null;
@@ -4352,7 +4564,12 @@ async function handleApiProxy(request, env, ctx, customPath, apiType) {
     }
     return null;
   }
-  if (apiType === "openai") {
+  if (apiType === "openai" && responseFastPath) {
+    systemInstructionText = responseFastPath.systemInstructionText;
+    contents = responseFastPath.contents;
+    contentsHaveFunctionCalls = responseFastPath.contentsHaveFunctionCalls;
+    toolsPayload = mapTools(responseFastPath.toolsBody, "openai", true, isClaudeModel);
+  } else if (apiType === "openai") {
     const systemInstructions = [];
     const systemMsg = body.messages.find((m) => m.role === "system" || m.role === "developer");
     if (systemMsg) {
@@ -4681,15 +4898,19 @@ async function handleApiProxy(request, env, ctx, customPath, apiType) {
     }
     let genConfig = apiType === "gemini" ? body.generationConfig || {} : {};
     if (apiType === "openai") {
-      if (body.temperature !== void 0) genConfig.temperature = body.temperature;
-      if (body.top_p !== void 0) genConfig.top_p = body.top_p;
-      if (body.max_tokens !== void 0) genConfig.maxOutputTokens = body.max_tokens;
-      if (body.response_format) {
-        if (body.response_format.type === "json_object" || body.response_format.type === "json_schema") {
+      const responseFormat = responseFastPath?.responseFormat || body.response_format;
+      const temperature = responseFastPath?.temperature ?? body.temperature;
+      const topP = responseFastPath?.topP ?? body.top_p;
+      const maxOutputTokens = responseFastPath?.maxOutputTokens ?? body.max_tokens;
+      if (temperature !== void 0) genConfig.temperature = temperature;
+      if (topP !== void 0) genConfig.top_p = topP;
+      if (maxOutputTokens !== void 0) genConfig.maxOutputTokens = maxOutputTokens;
+      if (responseFormat) {
+        if (responseFormat.type === "json_object" || responseFormat.type === "json_schema") {
           genConfig.responseMimeType = "application/json";
         }
-        if (body.response_format.type === "json_schema" && body.response_format.json_schema?.schema) {
-          genConfig.responseSchema = body.response_format.json_schema.schema;
+        if (responseFormat.type === "json_schema" && responseFormat.json_schema?.schema) {
+          genConfig.responseSchema = responseFormat.json_schema.schema;
           optimizeAndCleanSchema(genConfig.responseSchema, false);
         }
       }
@@ -4712,7 +4933,7 @@ async function handleApiProxy(request, env, ctx, customPath, apiType) {
       } else {
         const cachedSig = await getSessionSignature(env, sessionId);
         const actualIncludeThinking = shouldEnableThinking(body, resolvedModel, apiType);
-        innerRequest.contents = prepareAntigravityContents(contents, cachedSig, actualIncludeThinking);
+        innerRequest.contents = prepareAntigravityContents(contents, cachedSig, actualIncludeThinking, !!responseFastPath);
       }
     }
     const thinkingConfig = getUpstreamThinkingConfig(body, resolvedModel, apiType);
@@ -4746,15 +4967,19 @@ async function handleApiProxy(request, env, ctx, customPath, apiType) {
     requestHeaders["Client-Metadata"] = HEADERS_CA["Client-Metadata"];
     let genConfig = {};
     if (apiType === "openai") {
-      if (body.temperature !== void 0) genConfig.temperature = body.temperature;
-      if (body.top_p !== void 0) genConfig.top_p = body.top_p;
-      if (body.max_tokens !== void 0) genConfig.maxOutputTokens = body.max_tokens;
-      if (body.response_format) {
-        if (body.response_format.type === "json_object" || body.response_format.type === "json_schema") {
+      const responseFormat = responseFastPath?.responseFormat || body.response_format;
+      const temperature = responseFastPath?.temperature ?? body.temperature;
+      const topP = responseFastPath?.topP ?? body.top_p;
+      const maxOutputTokens = responseFastPath?.maxOutputTokens ?? body.max_tokens;
+      if (temperature !== void 0) genConfig.temperature = temperature;
+      if (topP !== void 0) genConfig.top_p = topP;
+      if (maxOutputTokens !== void 0) genConfig.maxOutputTokens = maxOutputTokens;
+      if (responseFormat) {
+        if (responseFormat.type === "json_object" || responseFormat.type === "json_schema") {
           genConfig.responseMimeType = "application/json";
         }
-        if (body.response_format.type === "json_schema" && body.response_format.json_schema?.schema) {
-          genConfig.responseSchema = body.response_format.json_schema.schema;
+        if (responseFormat.type === "json_schema" && responseFormat.json_schema?.schema) {
+          genConfig.responseSchema = responseFormat.json_schema.schema;
           optimizeAndCleanSchema(genConfig.responseSchema, false);
         }
       }
@@ -4796,6 +5021,33 @@ async function handleApiProxy(request, env, ctx, customPath, apiType) {
   let responseData = null;
   let sseLines = null;
   const MAX_RETRIES = 3;
+  // 单个客户端请求允许花在“等待后重试”上的累计时间。上游 429 的 Retry-After
+  // 最长可到 30s，单账号（或故障转移后的最后一个账号）之前会把它按每次重试
+  // 各算一遍，最坏约 60s，客户端往往先超时而不是收到上游错误。超过预算就不再
+  // 等待，直接把最后一次的上游响应返回给客户端。
+  const RETRY_WAIT_BUDGET_MS = 20000;
+  let retryWaitBudgetMs = RETRY_WAIT_BUDGET_MS;
+  // 429 恢复阶段只允许读“已有的配额信息”，同一个账号在本次客户端请求内最多读一次。
+  // 原逻辑在冷缓存时会走完整配额刷新（project info + models + quota summary 三次
+  // 上游调用，外加一堆对象构造与缓存写入），并且每次重试都重来一遍；在一个本就
+  // 失败的请求里，这是纯放大：调用次数、CPU、KV/Cache 写入全都变多。
+  const antigravityQuotaProbes = new Map();
+  const probeAntigravityQuotaExisting = (account) => {
+    const probeKey = account?.id || account?.email || "unknown";
+    const existing = antigravityQuotaProbes.get(probeKey);
+    if (existing) return existing;
+    const probe = (async () => {
+      try {
+        const result = await fetchAccountAntigravityQuotaData(account, username, env, ctx, false, true);
+        return !result?.error && result?.data ? result.data : null;
+      } catch (e) {
+        console.warn("[429] Failed to check antigravity quota:", e.message || e);
+        return null;
+      }
+    })();
+    antigravityQuotaProbes.set(probeKey, probe);
+    return probe;
+  };
   // 重试不得改动 contents：上下文必须逐字完整地重发。Antigravity 的
   // requestId 是一次逻辑请求的去重/路由标识；每个新的重试需要新 requestId，
   // 否则上游可能把同一个 429/空响应结果当成重复请求再次返回。
@@ -4886,6 +5138,9 @@ async function handleApiProxy(request, env, ctx, customPath, apiType) {
     let accountSucceeded = false;
     let shouldFailoverToNext = false;
     for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+    // Set when an Antigravity 429 looked transient (quota unknown or > 0) so the
+    // outer loop — not a nested retry storm — spends the remaining attempts.
+    let antigravityRetryable429 = false;
     const attemptPayload = buildAttemptPayload(cloudCodePayload, attempt, mode === "antigravity");
     try {
       const serializedAttemptPayload = serializeAttemptPayload(attemptPayload);
@@ -4916,54 +5171,21 @@ async function handleApiProxy(request, env, ctx, customPath, apiType) {
           break;
         }
         console.warn(`[429] entering recovery model=${resolvedModel} attempt=${attempt}/${MAX_RETRIES} requestId=${cloudCodePayload?.requestId || "none"} bytes=${basePayloadSerialized?.length || 0}`);
-        let quotaData = null;
-        try {
-          const quotaResult = await fetchAccountAntigravityQuotaData(currentAccount, username, env, ctx, true);
-          if (!quotaResult.error && quotaResult.data) {
-            quotaData = quotaResult.data;
-          }
-        } catch (e) {
-          console.warn("[429] Failed to check antigravity quota:", e.message || e);
-        }
+        // 只读“已有”的配额：forceRefresh=true 会在这里补打配额接口，
+        // cacheOnly=true 连冷缓存的补齐也跳过。429 恢复阶段任何额外上游调用都是
+        // 纯粹的放大器，也是大请求触发 Cloudflare Error 1102（超出 CPU 预算）
+        // 的推手之一。
+        const quotaData = await probeAntigravityQuotaExisting(currentAccount);
         const quotaPercentage = checkModelQuota(quotaData, resolvedModel);
         // 配额接口可能暂时失败或不返回该模型。429 本身仍可能是短时节流，
         // 因此“未知配额”也允许有限重试；只有明确报告 0% 时才直接返回。
+        // 重试交给外层 attempt 循环（每次都会换新 requestId）。此前这里再嵌套
+        // 一层 3 次重试，使单个客户端请求最多发出约 17 次上游调用，并对超长
+        // payload 反复序列化，正好把 isolate 的 CPU 预算耗尽并变成 1102。
         if (quotaPercentage === null || quotaPercentage > 0) {
           const quotaText = quotaPercentage === null ? "unknown" : `${quotaPercentage}%`;
-          console.warn(`[429] Antigravity model '${resolvedModel}' returned 429 with ${quotaText} quota remaining. Starting backoff retry (up to 3 times)...`);
-          const baseDelays = [2000, 5000, 10000];
-          const initialRetryAfter = googleRes?.headers?.get("Retry-After");
-          for (let retry = 1; retry <= 3; retry++) {
-            let backoffMs = baseDelays[retry - 1] + Math.floor(Math.random() * 1000);
-            const retryAfterHeader = googleRes?.headers?.get("Retry-After") || initialRetryAfter;
-            if (retryAfterHeader) {
-              const parsedSec = parseInt(retryAfterHeader, 10);
-              if (!isNaN(parsedSec) && parsedSec > 0 && parsedSec <= 30) {
-                backoffMs = parsedSec * 1000 + Math.floor(Math.random() * 500);
-              }
-            }
-            await sleep(backoffMs);
-            const retryPayload = buildAttemptPayload(cloudCodePayload, attempt + retry, true);
-            try {
-              const prevRes = googleRes;
-              // 与外层 attempt 使用同一个惰性序列化器。这里的 retryPayload
-              // 只改了顶层 requestId，不能再次 JSON.stringify 整个长上下文；
-              // 否则一次 429 会额外遍历数百 KB 的 contents/tools，正好把
-              // Cloudflare 的 CPU 预算消耗在无意义的重复序列化上。
-              const serializedRetryPayload = serializeAttemptPayload(retryPayload);
-              const nextRes = await callUpstream(method, requestHeaders, retryPayload, useStreamUpstream, serializedRetryPayload);
-              try { await prevRes?.body?.cancel(); } catch (e) {}
-              googleRes = nextRes;
-              if (googleRes.ok) {
-                break;
-              }
-              if (googleRes.status !== 429 && googleRes.status < 500 && googleRes.status !== 400) {
-                break;
-              }
-            } catch (retryErr) {
-              console.warn(`[429] Backoff retry ${retry}/3 failed:`, retryErr.message || retryErr);
-            }
-          }
+          console.warn(`[429] Antigravity model '${resolvedModel}' returned 429 with ${quotaText} quota remaining. Retrying in the outer attempt loop (${MAX_RETRIES - attempt} attempt(s) left)...`);
+          antigravityRetryable429 = true;
         }
       }
       if (status === 429 && mode === "codeassist" && hasNextAccount) {
@@ -4986,14 +5208,29 @@ async function handleApiProxy(request, env, ctx, customPath, apiType) {
       }
       if (!googleRes.ok) {
         const currentStatus = googleRes.status;
-        const retryableStatus = currentStatus === 400 || (currentStatus === 429 && mode !== "antigravity") || currentStatus === 408 || currentStatus >= 500;
+        // 400 不在此列：确定性错误，重试只会重复失败并放大调用次数。
+        const retryableStatus = (currentStatus === 429 && (mode !== "antigravity" || antigravityRetryable429)) || currentStatus === 408 || currentStatus >= 500;
         if (retryableStatus && attempt < MAX_RETRIES) {
-          try {
-            await googleRes.body?.cancel();
-          } catch (e) {
+          // 429 优先尊重上游 Retry-After（上限 30s），其余可重试状态保持短退避；
+          // 两者都受本次请求的累计等待预算约束，预算用尽则直接返回上游错误。
+          const retryAfterSec = currentStatus === 429 ? parseInt(googleRes.headers?.get("Retry-After") || "", 10) : NaN;
+          const desiredWaitMs = Number.isFinite(retryAfterSec) && retryAfterSec > 0
+            ? Math.min(30, retryAfterSec) * 1000 + Math.floor(Math.random() * 500)
+            : 250 * attempt;
+          const allowedWaitMs = Math.min(desiredWaitMs, retryWaitBudgetMs);
+          if (allowedWaitMs > 0) {
+            retryWaitBudgetMs -= allowedWaitMs;
+            try {
+              await googleRes.body?.cancel();
+            } catch (e) {
+            }
+            if (allowedWaitMs < desiredWaitMs) {
+              console.warn(`[retry] Wait budget capped a ${desiredWaitMs}ms backoff to ${allowedWaitMs}ms (HTTP ${currentStatus}).`);
+            }
+            await new Promise((r) => setTimeout(r, allowedWaitMs));
+            continue;
           }
-          await new Promise((r) => setTimeout(r, 250 * attempt));
-          continue;
+          console.warn(`[retry] Wait budget exhausted (${RETRY_WAIT_BUDGET_MS}ms); returning HTTP ${currentStatus} without further retries.`);
         }
         if (hasNextAccount && (currentStatus === 401 || currentStatus === 403 || currentStatus === 408 || currentStatus === 429 || currentStatus >= 500)) {
           try { await googleRes.body?.cancel(); } catch (_) {}
