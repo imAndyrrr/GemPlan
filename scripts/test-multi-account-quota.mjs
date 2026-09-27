@@ -28,9 +28,13 @@ ${extract("getUserAccounts")}
 const accountUsageMemory = new Map();
 const TRANSIENT_CACHE_MAX_ENTRIES = 2048;
 const transientJsonCache = new Map();
+const sessionIdCache = new Map();
+${extract("deriveSessionId")}
+${extract("transientCacheRequest")}
 ${extract("transientCacheKey")}
 ${extract("cloneTransientValue")}
 ${extract("readTransientJsonCacheSync")}
+${extract("getTransientJsonCache")}
 ${extract("rememberTransientJsonCache")}
 // 配额只写入 isolate 内存 + Cache API，KV 不是配额的存储层（生产 KV 里
 // quota:* 键为空）。测试按真实存储层播种：直接写 isolate 内存缓存。
@@ -40,6 +44,9 @@ function seedQuota(username, accountId, value) {
 ${extract("getAccountUsageKey")}
 ${extract("getEffectiveLastUsed")}
 ${extract("recordAccountUsage")}
+${extract("getAccountEligibilityKey")}
+${extract("getAccountEligibilityBlockUntil")}
+${extract("getAccountEligibilityBlocks")}
 ${extract("saveUser")}
 async function getAccountCooldowns(accounts) {
   return new Map((accounts || [])
@@ -48,16 +55,18 @@ async function getAccountCooldowns(accounts) {
 }
 ${extract("rankAccountsForRequest")}
 globalThis.__testFns = {
+  deriveSessionId,
   checkModelQuota,
   getUserAccounts,
   recordAccountUsage,
   saveUser,
   rankAccountsForRequest,
+  getAccountEligibilityBlocks,
   seedQuota
 };
 `;
 new Function(code)();
-const { checkModelQuota, getUserAccounts, recordAccountUsage, saveUser, rankAccountsForRequest, seedQuota } = globalThis.__testFns;
+const { deriveSessionId, checkModelQuota, getUserAccounts, recordAccountUsage, saveUser, rankAccountsForRequest, getAccountEligibilityBlocks, seedQuota } = globalThis.__testFns;
 
 // Test 1: Legacy user migration
 const legacyUser = {
@@ -355,5 +364,63 @@ if (deleteUser.google_tokens !== null || deleteUser.antigravity_tokens !== null)
   throw new Error("saveUser preserved legacy tokens after all accounts were deleted");
 }
 console.log("PASS: deleting all accounts clears legacy token mirrors");
+
+// Test 6: node eligibility survives isolate-cache loss through the Cache API.
+const cacheAccounts = [
+  { id: "acc_cache_blocked", mode: "antigravity", enabled: true, status: "active", priority: 100 },
+  { id: "acc_cache_healthy", mode: "antigravity", enabled: true, status: "active", priority: 0 }
+];
+const originalCaches = globalThis.caches;
+const eligibilityCacheValues = new Map();
+try {
+  globalThis.caches = {
+    default: {
+      async match(request) {
+        const value = eligibilityCacheValues.get(request.url);
+        return value === undefined ? undefined : new Response(JSON.stringify(value), {
+          headers: { "Content-Type": "application/json" }
+        });
+      },
+      async put(request, response) {
+        eligibilityCacheValues.set(request.url, await response.json());
+      },
+      async delete(request) {
+        eligibilityCacheValues.delete(request.url);
+      }
+    }
+  };
+  const blockedUntil = Math.floor(Date.now() / 1000) + 300;
+  eligibilityCacheValues.set(
+    "https://gemplan-cache.invalid/account-eligibility/" + encodeURIComponent(deriveSessionId("account-eligibility\0cache-user\0acc_cache_blocked\0SFO")),
+    { blocked_until: blockedUntil, colo: "SFO", reason: "location-1008" }
+  );
+  const cacheRanked = await rankAccountsForRequest(cacheAccounts, "gemini-2.5-flash", "cache-user", { GEMINI_KV: mockKV }, "SFO");
+  if (cacheRanked[0].id !== "acc_cache_healthy") {
+    throw new Error(`Cache-backed colo block did not deprioritize the blocked account, got ${cacheRanked[0].id}`);
+  }
+  const otherColoBlocks = await getAccountEligibilityBlocks(cacheAccounts, "cache-user", "FRA");
+  if (otherColoBlocks.size !== 0) {
+    throw new Error("A colo-local eligibility block leaked into another colo");
+  }
+  const blockedVsCooldown = await rankAccountsForRequest([
+    cacheAccounts[0],
+    {
+      id: "acc_rate_limited",
+      mode: "antigravity",
+      enabled: true,
+      status: "cooldown",
+      priority: 0,
+      cooldown_until: Math.floor(Date.now() / 1000) + 60
+    }
+  ], "gemini-2.5-flash", "cache-user", { GEMINI_KV: mockKV }, "SFO");
+  if (blockedVsCooldown[0].id !== "acc_cache_blocked") {
+    throw new Error(`Strict manual priority must keep the higher-priority account first, got ${blockedVsCooldown[0].id}`);
+  }
+  console.log("PASS: Cache API preserves Google eligibility blocks across Worker isolates");
+  console.log("PASS: strict manual priority is preserved even for known account-local eligibility blocks");
+} finally {
+  if (originalCaches === undefined) delete globalThis.caches;
+  else globalThis.caches = originalCaches;
+}
 
 console.log("\nALL MULTI-ACCOUNT & QUOTA TESTS PASSED!");

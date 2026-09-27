@@ -1,3 +1,4 @@
+import { peekResponsesSseUntilMeaningful, processResponsesSseStream } from "./responses-stream.js";
 var __defProp = Object.defineProperty;
 var __name = (target, value) => __defProp(target, "name", { value, configurable: true });
 
@@ -47,6 +48,40 @@ function hasOauthCredentials(config) {
 }
 __name(hasOauthCredentials, "hasOauthCredentials");
 __name2(hasOauthCredentials, "hasOauthCredentials");
+
+function normalizeGoogleEmail(value) {
+  const raw = String(value || "").trim().toLowerCase();
+  const match = raw.match(/[a-z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+/);
+  if (!match) return null;
+  let [local, domain] = match[0].split("@");
+  if (domain === "googlemail.com") domain = "gmail.com";
+  if (domain === "gmail.com") {
+    const plus = local.indexOf("+");
+    if (plus > 0) local = local.slice(0, plus);
+    local = local.replace(/\./g, "");
+  }
+  return `${local}@${domain}`;
+}
+__name(normalizeGoogleEmail, "normalizeGoogleEmail");
+__name2(normalizeGoogleEmail, "normalizeGoogleEmail");
+
+function compareGoogleIdentity(storedEmail, storedSub, incomingEmail, incomingSub) {
+  const oldSub = String(storedSub || "").trim();
+  const newSub = String(incomingSub || "").trim();
+  if (oldSub && newSub) return oldSub === newSub ? 1 : -1;
+
+  const oldEmail = normalizeGoogleEmail(storedEmail);
+  const newEmail = normalizeGoogleEmail(incomingEmail);
+  if (oldEmail && newEmail) return oldEmail === newEmail ? 1 : -1;
+
+  // Legacy account records may contain display labels instead of an actual
+  // Google email. Do not treat those labels as identity mismatches during
+  // explicit reauthorization.
+  return 0;
+}
+__name(compareGoogleIdentity, "compareGoogleIdentity");
+__name2(compareGoogleIdentity, "compareGoogleIdentity");
+
 var GEMINI_ENDPOINT = "https://cloudcode-pa.googleapis.com";
 var HEADERS_CA = {
   "User-Agent": "google-api-nodejs-client/9.15.1",
@@ -186,14 +221,14 @@ function trimForStructuralParse(text) {
 }
 __name(trimForStructuralParse, "trimForStructuralParse");
 __name2(trimForStructuralParse, "trimForStructuralParse");
-// CPU 优化：Codex CLI 等客户端每次请求携带完全相同的 tools schema（可达数十 KB），
-// optimizeAndCleanSchema 是全量递归 + structuredClone 的 CPU 热点。将清洗结果按
-// （模式, 工具名, 源 schema JSON）缓存到 isolate 级 Map，跨请求直接复用清洗后的
-// 深拷贝（structuredClone 只需一次）。源 schema 来自 request.json() 的临时对象，
-// 清洗结果只读地进入上游 payload，缓存不会造成跨请求污染。
-// 两个上限防止内存膨胀：schema 源串 >64KB 不缓存；每模式最多缓存 50 条（FIFO 淘汰）。
-var SCHEMA_CACHE_MAX_SCHEMA_BYTES = 65536;
-var SCHEMA_CACHE_MAX_ENTRIES = 50;
+// CPU 优化：Codex CLI 等客户端每次请求携带完全相同的 tools schema（单个工具可
+// 超过 80KB），optimizeAndCleanSchema 是全量递归的 CPU 热点。将清洗结果按
+// （模式, 工具名, 源 schema JSON）缓存到 isolate 级 Map。清洗结果只进入上游
+// payload，后续代码不会修改它，因此缓存命中直接复用同一对象，避免每次请求
+// structuredClone 一整棵大 schema。256KB 上限覆盖真实的大型 MCP 工具 schema；
+// 每模式最多缓存 24 条，最坏驻留约 6MB 源串加对象图。
+var SCHEMA_CACHE_MAX_SCHEMA_BYTES = 262144;
+var SCHEMA_CACHE_MAX_ENTRIES = 24;
 var schemaCleanCache = { openai: /* @__PURE__ */ new Map(), claude: /* @__PURE__ */ new Map(), gemini: /* @__PURE__ */ new Map() };
 function getCleanedSchema(apiType, cacheKey, sourceSchema, needsUppercase) {
   const cache = schemaCleanCache[apiType];
@@ -204,29 +239,25 @@ function getCleanedSchema(apiType, cacheKey, sourceSchema, needsUppercase) {
   let serialized = null;
   try {
     const candidate = JSON.stringify(sourceSchema);
-    // Do not retain very large schemas in the isolate cache. They still get
-    // cleaned for this request, but skipping the cache entry avoids pinning a
-    // large duplicate across requests and keeps eviction work bounded.
     if (candidate.length <= SCHEMA_CACHE_MAX_SCHEMA_BYTES) {
       serialized = candidate;
     }
-  } catch (e) {
+  } catch (_) {
     serialized = null;
   }
   // needsUppercase 必须进 key：同一工具名经 openai API 可能以两种模式出现
   //（Gemini 模型需大写类型 / Claude 模型保留 draft 小写类型），互相不可复用。
   const key = (needsUppercase ? "U" : "L") + "\u0000" + cacheKey + "\u0000" + (serialized === null ? "\u0001nojson\u0001" : serialized);
   if (serialized !== null && cache.has(key)) {
-    return structuredClone(cache.get(key));
+    return cache.get(key);
   }
   optimizeAndCleanSchema(sourceSchema, needsUppercase);
   if (serialized !== null) {
-    const cleanedClone = structuredClone(sourceSchema);
     if (cache.size >= SCHEMA_CACHE_MAX_ENTRIES) {
       const oldest = cache.keys().next().value;
       cache.delete(oldest);
     }
-    cache.set(key, cleanedClone);
+    cache.set(key, sourceSchema);
   }
   return sourceSchema;
 }
@@ -241,6 +272,333 @@ function looksLikeBlockArray(t) {
 }
 __name(looksLikeBlockArray, "looksLikeBlockArray");
 __name2(looksLikeBlockArray, "looksLikeBlockArray");
+function safeParseJson(str) {
+  if (typeof str !== "string") return null;
+  try {
+    return JSON.parse(str);
+  } catch (e1) {
+    if (str.length > 65536) return null;
+    try {
+      const sanitized = str.replace(/[\x00-\x1f]/g, (ch) => {
+        if (ch === "\n") return "\\n";
+        if (ch === "\r") return "\\r";
+        if (ch === "\t") return "\\t";
+        return "";
+      });
+      return JSON.parse(sanitized);
+    } catch (e2) {
+      return null;
+    }
+  }
+}
+__name(safeParseJson, "safeParseJson");
+__name2(safeParseJson, "safeParseJson");
+// Google validates inline image bytes strictly. A payload that base64-decodes but
+// is not a COMPLETE image fails the ENTIRE upstream request with
+// {"code":400,"message":"Request contains an invalid argument"} - which CCR surfaces
+// as "All target providers failed." and which bricks every later turn of the session,
+// because the bad blob stays in the resent history.
+//
+// Well-formed base64 is NOT sufficient evidence of a valid image. Client histories
+// routinely contain truncated fragments (log previews, echoed error text, cut-off tool
+// output), and a fragment such as "iVBORw0KGgoAAAANSUhEUgAAAZAA" is valid base64 of
+// valid length that decodes to garbage. Structural completeness (format signature AND
+// end-of-file marker or declared size) is therefore required before forwarding.
+function normalizeBase64Data(value) {
+  return typeof value === "string" ? value.replace(/\s+/g, "") : "";
+}
+__name(normalizeBase64Data, "normalizeBase64Data");
+__name2(normalizeBase64Data, "normalizeBase64Data");
+// Decodes an arbitrary window of a base64 string without requiring the window itself
+// to be 4-char aligned. The first bytes of the returned binary string are always
+// faithful to the original byte stream.
+function decodeBase64Window(b64, startChar, charCount) {
+  let win = String(b64).slice(startChar, startChar + charCount).replace(/[^A-Za-z0-9+/]/g, "");
+  const rem = win.length % 4;
+  if (rem === 1) win = win.slice(0, -1);
+  else if (rem === 2) win += "==";
+  else if (rem === 3) win += "=";
+  if (!win) return "";
+  try {
+    return atob(win);
+  } catch (e) {
+    return "";
+  }
+}
+__name(decodeBase64Window, "decodeBase64Window");
+__name2(decodeBase64Window, "decodeBase64Window");
+function readImageBytes(b64, offset, count) {
+  const startChar = Math.floor(offset / 3) * 4;
+  const skip = offset - startChar / 4 * 3;
+  const needChars = Math.ceil((skip + count) / 3) * 4 + 4;
+  const win = decodeBase64Window(b64, startChar, needChars);
+  if (win.length < skip + count) return "";
+  return win.slice(skip, skip + count);
+}
+__name(readImageBytes, "readImageBytes");
+__name2(readImageBytes, "readImageBytes");
+function base64ByteLength(b64) {
+  const n = b64.length;
+  if (n < 4 || n % 4 !== 0) return 0;
+  let pad = 0;
+  if (b64.endsWith("==")) pad = 2;
+  else if (b64.endsWith("=")) pad = 1;
+  return n / 4 * 3 - pad;
+}
+__name(base64ByteLength, "base64ByteLength");
+__name2(base64ByteLength, "base64ByteLength");
+function be32(s, i) {
+  return (s.charCodeAt(i) << 24 | s.charCodeAt(i + 1) << 16 | s.charCodeAt(i + 2) << 8 | s.charCodeAt(i + 3)) >>> 0;
+}
+__name(be32, "be32");
+__name2(be32, "be32");
+function le32(s, i) {
+  return (s.charCodeAt(i) | s.charCodeAt(i + 1) << 8 | s.charCodeAt(i + 2) << 16 | s.charCodeAt(i + 3) << 24) >>> 0;
+}
+__name(le32, "le32");
+__name2(le32, "le32");
+function detectImageFormat(head) {
+  if (head.length < 12) return null;
+  const c0 = head.charCodeAt(0), c1 = head.charCodeAt(1), c2 = head.charCodeAt(2), c3 = head.charCodeAt(3);
+  if (c0 === 137 && c1 === 80 && c2 === 78 && c3 === 71) return "png";
+  if (c0 === 255 && c1 === 216 && c2 === 255) return "jpeg";
+  if (head.startsWith("GIF8")) return "gif";
+  if (head.startsWith("RIFF") && head.slice(8, 12) === "WEBP") return "webp";
+  if (c0 === 66 && c1 === 77) return "bmp";
+  if (c0 === 73 && c1 === 73 && c2 === 42 && c3 === 0) return "tiff";
+  if (c0 === 77 && c1 === 77 && c2 === 0 && c3 === 42) return "tiff";
+  if (head.slice(4, 8) === "ftyp") return "heif";
+  return null;
+}
+__name(detectImageFormat, "detectImageFormat");
+__name2(detectImageFormat, "detectImageFormat");
+// ISO-BMFF (HEIC/HEIF): walk top-level boxes and require them to tile the file exactly.
+function heifBoxesComplete(b64, byteLen) {
+  let offset = 0, guard = 0;
+  while (offset < byteLen && guard++ < 128) {
+    const header = readImageBytes(b64, offset, 16);
+    if (header.length < 8) return false;
+    let size = be32(header, 0);
+    let headerLen = 8;
+    if (size === 1) {
+      if (header.length < 16) return false;
+      size = be32(header, 8) * 4294967296 + be32(header, 12);
+      headerLen = 16;
+    } else if (size === 0) {
+      size = byteLen - offset;
+    }
+    if (size < headerLen) return false;
+    offset += size;
+  }
+  return offset === byteLen;
+}
+__name(heifBoxesComplete, "heifBoxesComplete");
+__name2(heifBoxesComplete, "heifBoxesComplete");
+function imagePayloadComplete(format, head, tail, b64, byteLen) {
+  if (format === "png") {
+    if (byteLen < 45 || head.length < 24) return false;
+    const w = be32(head, 16), h = be32(head, 20);
+    if (w === 0 || h === 0 || w > 100000 || h > 100000) return false;
+    return tail.indexOf("IEND\xae\x42\x60\x82") !== -1;
+  }
+  if (format === "jpeg") {
+    if (byteLen < 125 || tail.length < 2) return false;
+    return tail.indexOf("\xff\xd9") !== -1;
+  }
+  if (format === "gif") {
+    if (byteLen < 32 || tail.length < 1) return false;
+    return tail.charCodeAt(tail.length - 1) === 59;
+  }
+  if (format === "webp") {
+    if (byteLen < 30 || head.length < 12) return false;
+    return le32(head, 4) + 8 === byteLen;
+  }
+  if (format === "bmp") {
+    if (byteLen < 54 || head.length < 8) return false;
+    return le32(head, 2) === byteLen;
+  }
+  if (format === "tiff") {
+    const little = head.charCodeAt(0) === 73;
+    const ifd = little ? le32(head, 4) : be32(head, 4);
+    if (!ifd || ifd + 2 > byteLen) return false;
+    const raw = readImageBytes(b64, ifd, 2);
+    if (raw.length < 2) return false;
+    const entries = little ? raw.charCodeAt(0) | raw.charCodeAt(1) << 8 : raw.charCodeAt(0) << 8 | raw.charCodeAt(1);
+    return ifd + 2 + entries * 12 + 4 <= byteLen;
+  }
+  if (format === "heif") return heifBoxesComplete(b64, byteLen);
+  return false;
+}
+__name(imagePayloadComplete, "imagePayloadComplete");
+__name2(imagePayloadComplete, "imagePayloadComplete");
+var IMAGE_FORMAT_MIME = {
+  png: "image/png",
+  jpeg: "image/jpeg",
+  gif: "image/gif",
+  webp: "image/webp",
+  bmp: "image/bmp",
+  tiff: "image/tiff",
+  heif: "image/heic"
+};
+// Returns { mimeType, data } only for payloads proven to be complete images. The MIME
+// type is derived from the bytes rather than trusted from the caller, so a mislabelled
+// data URI cannot reach Google as an invalid argument.
+function inspectImagePayload(value) {
+  const b64 = normalizeBase64Data(value);
+  if (b64.length < 16 || b64.length % 4 !== 0) return null;
+  if (!/^[A-Za-z0-9+/]+={0,2}$/.test(b64)) return null;
+  const byteLen = base64ByteLength(b64);
+  if (byteLen < 32) return null;
+  const head = decodeBase64Window(b64, 0, 64);
+  const format = detectImageFormat(head);
+  if (!format) return null;
+  const tailLen = Math.min(b64.length, 5464);
+  const tail = decodeBase64Window(b64, b64.length - tailLen, tailLen);
+  if (!imagePayloadComplete(format, head, tail, b64, byteLen)) return null;
+  return { mimeType: IMAGE_FORMAT_MIME[format], data: b64 };
+}
+__name(inspectImagePayload, "inspectImagePayload");
+__name2(inspectImagePayload, "inspectImagePayload");
+
+function extractImageFromBlock(blk) {
+  if (!blk || typeof blk !== "object") return null;
+  const blkType = String(blk.type || "").toLowerCase();
+  const candidates = [];
+  if (blk.inlineData && blk.inlineData.data) candidates.push(blk.inlineData.data);
+  if (blk.source && typeof blk.source === "object" && typeof blk.source.data === "string" && blk.source.data) {
+    candidates.push(blk.source.data);
+  }
+  if (blkType.includes("image") && typeof blk.data === "string" && blk.data) candidates.push(blk.data);
+  const url = typeof blk.image_url === "string" ? blk.image_url : blk.image_url?.url || (blkType.includes("image") ? blk.url : null);
+  const isDataUri = typeof url === "string" && url.startsWith("data:");
+  if (isDataUri) {
+    const commaIdx = url.indexOf(",");
+    if (commaIdx !== -1) candidates.push(url.substring(commaIdx + 1));
+  }
+  for (const candidate of candidates) {
+    const verified = inspectImagePayload(candidate);
+    if (verified) return { inlineData: verified };
+  }
+  if (blk.fileData && blk.fileData.fileUri) {
+    return {
+      fileData: {
+        fileUri: blk.fileData.fileUri,
+        mimeType: blk.fileData.mimeType || blk.media_type || "image/png"
+      }
+    };
+  }
+  if (typeof url === "string" && url && !isDataUri) {
+    return { fileData: { fileUri: url, mimeType: blk.media_type || blk.mime_type || "image/png" } };
+  }
+  return null;
+}
+__name(extractImageFromBlock, "extractImageFromBlock");
+__name2(extractImageFromBlock, "extractImageFromBlock");
+
+function extractToolResultMediaAndText(content) {
+  if (typeof content === "string") {
+    // Plain text is by far the common case. Inspect only the first non-space
+    // character before considering structured media, avoiding three full scans
+    // of multi-megabyte command output on every tool result.
+    let start = 0;
+    while (start < content.length && /\s/u.test(content[start])) start++;
+    const firstChar = start < content.length ? content.charCodeAt(start) : -1;
+    if (firstChar !== 0x5b && firstChar !== 0x7b) {
+      return { textParts: [content], mediaParts: [], resultText: content };
+    }
+    if (content.length > 65536) {
+      const head = content.slice(0, 1024);
+      const tail = content.slice(-1024);
+      if (!head.includes("image") && !head.includes("inlineData") && !tail.includes("image") && !tail.includes("inlineData")) {
+        return { textParts: [content], mediaParts: [], resultText: content };
+      }
+    }
+    if (!content.includes("image") && !content.includes("inlineData") && !content.includes("fileData")) {
+      return { textParts: [content], mediaParts: [], resultText: content };
+    }
+  }
+  const textParts = [];
+  const mediaParts = [];
+  let hadOmittedImage = false;
+
+  const handleBlock = (blk) => {
+    if (!blk) return;
+    if (typeof blk === "string") {
+      handleString(blk);
+      return;
+    }
+    if (typeof blk !== "object") {
+      textParts.push(String(blk));
+      return;
+    }
+    const blkType = String(blk.type || "").toLowerCase();
+    if (blkType === "text" || blkType === "input_text" || blkType === "output_text") {
+      if (typeof blk.text === "string" && blk.text) textParts.push(blk.text);
+      return;
+    }
+    const imgPart = extractImageFromBlock(blk);
+    if (imgPart) {
+      mediaParts.push(imgPart);
+      return;
+    }
+    if (blkType.includes("image") || blk.inlineData || blk.source || blk.image_url) {
+      hadOmittedImage = true;
+      textParts.push("Image attachment omitted: base64 data is truncated or invalid.");
+      return;
+    }
+    if (blk.content !== void 0) { handleContent(blk.content); return; }
+    if (blk.output !== void 0) { handleContent(blk.output); return; }
+    if (blk.result !== void 0) { handleContent(blk.result); return; }
+    if (typeof blk.text === "string" && blk.text) { textParts.push(blk.text); return; }
+    textParts.push(JSON.stringify(blk));
+  };
+
+  const handleString = (str) => {
+    if (!str || typeof str !== "string") return;
+    if (str.length > 65536 && !str.includes("image") && !str.includes("inlineData") && !str.includes("fileData")) {
+      textParts.push(str);
+      return;
+    }
+    const trimmed = str.trim();
+    // Only a structurally declared image block is turned into media. Plain text is
+    // forwarded verbatim even when it contains a data URI, because the caller may be
+    // sending base64 on purpose (asking the model to analyse it, quoting source code
+    // that mentions data URLs, dumping logs). Reinterpreting prose as an image would
+    // silently change the request.
+    const declaresImage = /"type"\s*:\s*"(?:input_)?image(?:_url)?"|"inlineData"|"fileData"/i.test(trimmed);
+    if (declaresImage) {
+      let parsed = null;
+      if (trimmed.startsWith("[") && trimmed.endsWith("]") || trimmed.startsWith("{") && trimmed.endsWith("}")) {
+        parsed = safeParseJson(trimmed);
+      }
+      if (parsed && typeof parsed === "object") {
+        const preMediaCount = mediaParts.length;
+        const preTextCount = textParts.length;
+        const preOmitted = hadOmittedImage;
+        if (Array.isArray(parsed)) {
+          for (const item of parsed) handleBlock(item);
+        } else {
+          handleBlock(parsed);
+        }
+        if (mediaParts.length > preMediaCount || hadOmittedImage !== preOmitted) return;
+        // No image found inside the JSON: keep the original text untouched.
+        textParts.length = preTextCount;
+      }
+    }
+    textParts.push(str);
+  };
+
+  const handleContent = (val) => {
+    if (Array.isArray(val)) { for (const item of val) handleBlock(item); }
+    else if (typeof val === "string") { handleString(val); }
+    else if (val && typeof val === "object") { handleBlock(val); }
+  };
+
+  handleContent(content);
+  return { textParts, mediaParts };
+}
+__name(extractToolResultMediaAndText, "extractToolResultMediaAndText");
+__name2(extractToolResultMediaAndText, "extractToolResultMediaAndText");
 // 每次 optimizeAndCleanSchema 调用都会遍历此列表做 delete，提前到模块级
 // 避免递归每个 schema 节点都重新分配 24 元素数组。
 var GOOGLE_FORBIDDEN_KEYS = [
@@ -847,14 +1205,22 @@ function sortClaudeBlocks(blocks) {
 }
 __name(sortClaudeBlocks, "sortClaudeBlocks");
 __name2(sortClaudeBlocks, "sortClaudeBlocks");
+var sessionIdCache = /* @__PURE__ */ new Map();
 function deriveSessionId(accountId) {
+  const cached = sessionIdCache.get(accountId);
+  if (cached !== void 0) return cached;
   let hash = -3750763034362895579n;
   const bytes = new TextEncoder().encode(accountId);
   for (const byte of bytes) {
     hash = BigInt.asIntN(64, hash * 1099511628211n);
     hash = BigInt.asIntN(64, hash ^ BigInt(byte));
   }
-  return hash.toString();
+  const sessionId = hash.toString();
+  if (sessionIdCache.size >= 128) {
+    sessionIdCache.delete(sessionIdCache.keys().next().value);
+  }
+  sessionIdCache.set(accountId, sessionId);
+  return sessionId;
 }
 __name(deriveSessionId, "deriveSessionId");
 __name2(deriveSessionId, "deriveSessionId");
@@ -1307,38 +1673,8 @@ function responseContentToGeminiParts(content, parts) {
       continue;
     }
     if (type !== "image" && type !== "image_url" && type !== "input_image") continue;
-    const source = block.source;
-    if (source && typeof source === "object" && source.data) {
-      parts.push({
-        inlineData: {
-          mimeType: source.media_type || "image/png",
-          data: source.data
-        }
-      });
-      continue;
-    }
-    const rawUrl = typeof block.image_url === "string"
-      ? block.image_url
-      : block.image_url?.url || block.url;
-    if (!rawUrl || typeof rawUrl !== "string") continue;
-    if (rawUrl.startsWith("data:")) {
-      const commaIndex = rawUrl.indexOf(",");
-      if (commaIndex === -1) continue;
-      const semiIndex = rawUrl.indexOf(";");
-      parts.push({
-        inlineData: {
-          mimeType: semiIndex > 5 ? rawUrl.substring(5, semiIndex) : "image/png",
-          data: rawUrl.substring(commaIndex + 1)
-        }
-      });
-    } else {
-      parts.push({
-        fileData: {
-          fileUri: rawUrl,
-          mimeType: block.media_type || block.mime_type || "image/png"
-        }
-      });
-    }
+    const imagePart = extractImageFromBlock(block);
+    if (imagePart) parts.push(imagePart);
   }
 }
 __name(responseContentToGeminiParts, "responseContentToGeminiParts");
@@ -1354,8 +1690,17 @@ function responsesRequestToGeminiRequest(body) {
   const contents = [];
   const functionNames = new Map();
   const pendingFunctionResponses = new Map();
-  const input = Array.isArray(body?.input) ? body.input : [];
+  const input = Array.isArray(body?.input)
+    ? body.input
+    : (typeof body?.input === "string" ? [body.input] : []);
+  // Keep every completed tool pair byte-for-byte. A second full scan that
+  // normalized and indexed multi-megabyte outputs pushed large lossless
+  // histories over the Free Worker CPU limit.
+  const collapsedPairCount = 0;
   let contentsHaveFunctionCalls = false;
+  let allToolCallsHaveRealSignatures = true;
+  let toolCallIdsUnique = true;
+  const seenToolCallIds = /* @__PURE__ */ new Set();
   const appendParts = (role, parts, forceSeparate = false) => {
     if (!parts || parts.length === 0) return;
     const previous = contents[contents.length - 1];
@@ -1389,7 +1734,8 @@ function responsesRequestToGeminiRequest(body) {
     }
     systemInstructionText = instructionParts.join("\n\n");
   }
-  for (const item of input) {
+  for (let itemIndex = 0; itemIndex < input.length; itemIndex++) {
+    const item = input[itemIndex];
     if (!item || typeof item !== "object") {
       if (typeof item === "string") appendParts("user", [{ text: item }]);
       continue;
@@ -1408,6 +1754,12 @@ function responsesRequestToGeminiRequest(body) {
       const toolIdentity = decodeToolCallIdentity(item.call_id || item.id || "");
       const rawId = item.call_id || item.id || "";
       const functionName = item.name || "unknown";
+      if (!toolIdentity.thoughtSignature) allToolCallsHaveRealSignatures = false;
+      if (!toolIdentity.id || seenToolCallIds.has(toolIdentity.id)) {
+        toolCallIdsUnique = false;
+      } else {
+        seenToolCallIds.add(toolIdentity.id);
+      }
       if (rawId) functionNames.set(rawId, functionName);
       if (toolIdentity.id) functionNames.set(toolIdentity.id, functionName);
       // Responses normally places the call before its output, but preserve
@@ -1435,13 +1787,18 @@ function responsesRequestToGeminiRequest(body) {
     if (item.type === "function_call_output") {
       const toolIdentity = decodeToolCallIdentity(item.call_id || item.id || "");
       const id = toolIdentity.id;
-      const functionResponse = {
-        functionResponse: {
-          name: functionNames.get(id) || "unknown",
-          response: { result: responseOutputToGeminiText(item.output) },
-          id
-        }
+      const extracted = extractToolResultMediaAndText(item.output);
+      const { mediaParts } = extracted;
+      const resultText = extracted.resultText ?? ((extracted.textParts.length === 1 ? extracted.textParts[0] : extracted.textParts.join("\n")) || (mediaParts.length > 0 ? "Image content attached" : responseOutputToGeminiText(item.output)));
+      const funcResp = {
+        name: functionNames.get(id) || "unknown",
+        response: { result: resultText },
+        id
       };
+      if (mediaParts.length > 0) {
+        funcResp.parts = mediaParts;
+      }
+      const functionResponse = { functionResponse: funcResp };
       if (!functionNames.has(id)) {
         const pending = pendingFunctionResponses.get(id);
         if (pending) pending.push(functionResponse);
@@ -1498,7 +1855,9 @@ function responsesRequestToGeminiRequest(body) {
           : void 0
       : void 0,
     messageCount: input.length || 1,
-    contentsHaveFunctionCalls
+    contentsHaveFunctionCalls,
+    contentsAreAntigravityPrepared: contentsHaveFunctionCalls && allToolCallsHaveRealSignatures && toolCallIdsUnique,
+    collapsedPairCount
   };
 }
 __name(responsesRequestToGeminiRequest, "responsesRequestToGeminiRequest");
@@ -1632,8 +1991,13 @@ function googleResponseToResponses(data, inputModel, mode) {
 }
 __name(googleResponseToResponses, "googleResponseToResponses");
 __name2(googleResponseToResponses, "googleResponseToResponses");
-async function callUpstream(method, requestHeaders, payload, isStream, serializedPayload) {
-  const isCodeAssist = requestHeaders && requestHeaders["Client-Metadata"] && !requestHeaders["x-client-name"];
+async function callUpstream(method, requestHeaders, payload, isStream, serializedPayload, routeMode = null, requestColo = null) {
+  // Route selection must be explicit. Inferring it from mutable headers allowed
+  // an Antigravity request to be mistaken for CodeAssist during auth/refresh
+  // flows, which produced the CodeAssist #3501 license response.
+  const isCodeAssist = routeMode ? routeMode === "codeassist" : !!(requestHeaders && requestHeaders["Client-Metadata"] && !requestHeaders["x-client-name"]);
+  const routeEnvelope = payload?.requestType === "agent" ? "antigravity-agent" : "codeassist";
+  console.warn(`[upstream-route] mode=${routeMode || "inferred"} envelope=${routeEnvelope} client=${requestHeaders?.["x-client-name"] || "codeassist"} project=${payload?.project === "" ? "empty" : payload?.project ? "set" : "none"} colo=${requestColo || "unknown"}`);
   const baseUrls = isCodeAssist ? [
     "https://cloudcode-pa.googleapis.com/v1internal"
   ] : [
@@ -2050,6 +2414,8 @@ async function processResponsesStreamLines(lines, writableStream, inputModel, mo
     usage: responseUsageFromGoogle(finalUsage)
   };
     await emit("response.completed", { response: finalResponse });
+    // OpenAI Responses SSE 流的标准结束标记：确保下游（CCR/Codex）能可靠检测流终止。
+    await writer.write(encoder.encode("data: [DONE]\n\n"));
   } finally {
     try {
       await writer.close();
@@ -2712,6 +3078,7 @@ async function handleDashboard(request, env) {
                   优先级
                   <input type="number" min="0" max="100" step="1" value="${Math.min(100, Math.max(0, Number.isFinite(Number(acc.priority)) ? Number(acc.priority) : 0))}" onchange="setAccountPriority('${acc.id}', this.value)" style="width:58px; padding:4px 6px; margin:0; font-size:12px;">
                 </label>
+                ${acc.status === "error" ? `<button class="btn-sm" data-reauthorize-mode="${escapeHtml(acc.mode)}" data-reauthorize-account="${escapeHtml(acc.id)}" onclick="reauthorizeAccount(this.dataset.reauthorizeMode, this.dataset.reauthorizeAccount)" style="background:#6f42c1;">重新授权</button>` : ''}
                 <button class="btn-sm" onclick="toggleAccount('${acc.id}', ${acc.enabled === false})" style="background:${acc.enabled !== false ? '#6c757d' : '#28a745'};">${acc.enabled !== false ? '\u7981\u7528' : '\u542F\u7528'}</button>
                 ${isCooling ? `<button class="btn-sm" onclick="resetAccountCooldown('${acc.id}')" style="background:#fd7e14;">\u89E3\u9664\u51B7\u5374</button>` : ''}
                 <button class="btn-sm" onclick="deleteAccount('${acc.id}')" style="background:#dc3545;">\u5220\u9664</button>
@@ -2773,11 +3140,21 @@ async function handleDashboard(request, env) {
       <h3>\u7B2C\u56DB\u90E8\u5206\uFF1A\u4E34\u65F6\u804A\u5929\u6D4B\u8BD5</h3>
       <p style="font-size:12px;color:#666;margin-bottom:15px;">\u60A8\u53EF\u4EE5\u5728\u6B64\u8FDB\u884C\u4E34\u65F6\u7684\u591A\u8F6E\u804A\u5929\u6D4B\u8BD5\u3002\u5BF9\u8BDD\u5386\u53F2\u548C\u9009\u62E9\u7684\u6A21\u578B\u4F1A\u6253\u5305\u76F4\u63A5\u8BF7\u6C42\u60A8\u7684\u4E13\u5C5E\u7AEF\u70B9\uFF0C\u5386\u53F2\u4EC5\u4FDD\u5B58\u5728\u6D4F\u89C8\u5668\u5185\u5B58\u4E2D\uFF0C\u4E0D\u4F1A\u5728\u670D\u52A1\u5668\u7AEF\u6301\u4E45\u4FDD\u5B58\u3002</p>
       
-      <div style="display: flex; gap: 10px; align-items: center; margin-bottom: 12px; flex-wrap: wrap;">
+      <div style="display: flex; gap: 10px; align-items: center; margin-bottom: 8px; flex-wrap: wrap;">
         <span style="font-weight: bold; font-size: 14px; color: #495057;">\u6D4B\u8BD5\u6A21\u578B\u540D\u79F0:</span>
-        <input type="text" id="chat-model-input" value="gemini-2.5-flash-agy" style="padding: 8px; border: 1px solid #ced4da; border-radius: 4px; flex: 1; min-width: 200px;" placeholder="\u8F93\u5165\u6A21\u578B\u540D\u79F0" />
+        <select id="chat-model-select" onchange="selectChatModel(this.value)" title="真实模型列表，可滚动查看全部模型" style="padding: 8px; border: 1px solid #ced4da; border-radius: 4px; flex: 1; min-width: 220px; max-width: 360px;">
+          <option value="">从真实模型列表选择</option>
+        </select>
+        <input type="text" id="chat-model-input" value="gemini-2.5-flash-agy" style="padding: 8px; border: 1px solid #ced4da; border-radius: 4px; flex: 1; min-width: 220px;" placeholder="也可直接输入模型名称" />
       </div>
-
+      <div style="display: flex; gap: 10px; align-items: center; margin-bottom: 8px; flex-wrap: wrap;">
+        <span style="font-weight: bold; font-size: 14px; color: #495057;">\u6D4B\u8BD5\u8D26\u53F7:</span>
+        <select id="chat-account-select" onchange="loadChatModels()" title="自动调度遇到 403/429 时会转移到其他账号；指定账号只测试该账号，不自动转移" style="padding: 8px; border: 1px solid #ced4da; border-radius: 4px; flex: 1; min-width: 220px;">
+          <option value="">\u81EA\u52A8\u8C03\u5EA6\u8D26\u53F7</option>
+          ${accounts.map((acc) => '<option value="' + escapeHtml(acc.id) + '">' + (acc.mode === "antigravity" ? "Antigravity" : "CodeAssist") + ' - ' + escapeHtml(acc.email || acc.id) + (acc.name ? ' (' + escapeHtml(acc.name) + ')' : '') + '</option>').join("")}
+        </select>
+      </div>
+      <div id="chat-model-list-status" style="font-size:12px;color:#666;margin-bottom:12px;"></div>
       <div style="border: 1px solid #dee2e6; border-radius: 8px; background: #ffffff; display: flex; flex-direction: column; height: 380px; box-shadow: inset 0 2px 4px rgba(0,0,0,0.02);">
         <div id="chat-messages" style="flex: 1; overflow-y: auto; padding: 15px; display: flex; flex-direction: column; gap: 12px; border-bottom: 1px solid #dee2e6;">
         </div>
@@ -2798,11 +3175,56 @@ async function handleDashboard(request, env) {
         messagesDiv.innerHTML = '';
       }
 
+      const chatCustomPath = "${user.api_config.custom_path}";
+      const chatApiKey = "${user.api_config.api_key}";
+
+      function selectChatModel(value) {
+        if (value) document.getElementById("chat-model-input").value = value;
+      }
+
+      async function loadChatModels() {
+        const modelSelect = document.getElementById("chat-model-select");
+        const accountSelect = document.getElementById("chat-account-select");
+        const statusEl = document.getElementById("chat-model-list-status");
+        const accountId = accountSelect ? accountSelect.value : "";
+        const params = new URLSearchParams({ real: "1" });
+        if (accountId) params.set("account_id", accountId);
+        statusEl.textContent = "正在刷新真实模型列表...";
+        try {
+          const response = await fetch("/" + chatCustomPath + "/v1/models?" + params.toString(), {
+            headers: { "Authorization": "Bearer " + chatApiKey }
+          });
+          const data = await response.json();
+          if (!response.ok) throw new Error(data.error || data.error?.message || ("HTTP " + response.status));
+          const models = Array.isArray(data.data) ? data.data : [];
+          modelSelect.innerHTML = '<option value="">从真实模型列表选择</option>';
+          for (const item of models) {
+            if (!item || !item.id) continue;
+            const option = document.createElement("option");
+            option.value = item.id;
+            const labels = [];
+            if (item.display_name) labels.push(item.display_name);
+            if (item.quota_percentage != null) labels.push("配额 " + item.quota_percentage + "%");
+            option.textContent = labels.length > 0 ? item.id + " · " + labels.join(" · ") : item.id;
+            modelSelect.appendChild(option);
+          }
+          statusEl.textContent = models.length > 0
+            ? "已加载 " + models.length + " 个真实模型，可从完整下拉列表选择或直接输入"
+            : "该账号暂未返回可用模型，仍可直接输入模型名称";
+        } catch (err) {
+          modelSelect.innerHTML = '<option value="">从真实模型列表选择</option>';
+          statusEl.textContent = "真实模型列表刷新失败: " + err.message;
+        }
+      }
+
+      loadChatModels();
+
       async function sendChatMessage() {
         const inputEl = document.getElementById("chat-input");
         const sendBtn = document.getElementById("chat-send-btn");
         const messagesDiv = document.getElementById("chat-messages");
         const modelInput = document.getElementById("chat-model-input");
+        const accountSelect = document.getElementById("chat-account-select");
 
         const text = inputEl.value.trim();
         if (!text) return;
@@ -2854,14 +3276,15 @@ async function handleDashboard(request, env) {
         messagesDiv.scrollTop = messagesDiv.scrollHeight;
 
         try {
-          const customPath = "${user.api_config.custom_path}";
-          const apiKey = "${user.api_config.api_key}";
+
           
-          const response = await fetch("/" + customPath + "/v1/chat/completions", {
+          const accountId = accountSelect ? accountSelect.value : "";
+          const query = accountId ? "?account_id=" + encodeURIComponent(accountId) : "";
+          const response = await fetch("/" + chatCustomPath + "/v1/chat/completions" + query, {
             method: "POST",
             headers: {
               "Content-Type": "application/json",
-              "Authorization": "Bearer " + apiKey
+              "Authorization": "Bearer " + chatApiKey
             },
             body: JSON.stringify({
               model: model,
@@ -2930,6 +3353,11 @@ async function handleDashboard(request, env) {
           inputEl.focus();
           messagesDiv.scrollTop = messagesDiv.scrollHeight;
         }
+      }
+
+      function reauthorizeAccount(mode, id) {
+        const params = new URLSearchParams({ mode, account_id: id });
+        window.open("/api/auth/google/start?" + params.toString(), "_blank");
       }
 
       async function toggleAccount(id, toEnable) {
@@ -3364,6 +3792,77 @@ function clearAccountCooldown(username, accountId, ctx) {
 }
 __name(clearAccountCooldown, "clearAccountCooldown");
 __name2(clearAccountCooldown, "clearAccountCooldown");
+function getAccountEligibilityKey(username, accountId, colo) {
+  return `${username}\u0000${accountId}\u0000${colo || "unknown"}`;
+}
+__name(getAccountEligibilityKey, "getAccountEligibilityKey");
+__name2(getAccountEligibilityKey, "getAccountEligibilityKey");
+function rememberAccountEligibilityBlock(username, account, colo, reason, ctx, ttlSeconds = 300) {
+  if (!username || !account?.id) return;
+  const key = getAccountEligibilityKey(username, account.id, colo);
+  putTransientJsonCache(
+    "account-eligibility",
+    key,
+    {
+      blocked_until: Math.floor(Date.now() / 1e3) + ttlSeconds,
+      colo: colo || "unknown",
+      reason: reason || "google-eligibility"
+    },
+    ttlSeconds,
+    ctx
+  );
+}
+__name(rememberAccountEligibilityBlock, "rememberAccountEligibilityBlock");
+__name2(rememberAccountEligibilityBlock, "rememberAccountEligibilityBlock");
+function clearAccountEligibilityBlock(username, accountId, colo, ctx) {
+  const key = getAccountEligibilityKey(username, accountId, colo);
+  transientJsonCache.delete(transientCacheKey("account-eligibility", key));
+  if (typeof caches === "undefined" || !caches.default) return;
+  const promise = caches.default.delete(transientCacheRequest("account-eligibility", key)).catch(() => false);
+  if (ctx?.waitUntil) ctx.waitUntil(promise);
+}
+__name(clearAccountEligibilityBlock, "clearAccountEligibilityBlock");
+__name2(clearAccountEligibilityBlock, "clearAccountEligibilityBlock");
+async function getAccountEligibilityBlockUntil(username, accountId, colo) {
+  const value = await getTransientJsonCache(
+    "account-eligibility",
+    getAccountEligibilityKey(username, accountId, colo),
+    900
+  );
+  return Number(value?.blocked_until) || 0;
+}
+__name(getAccountEligibilityBlockUntil, "getAccountEligibilityBlockUntil");
+__name2(getAccountEligibilityBlockUntil, "getAccountEligibilityBlockUntil");
+async function getAccountEligibilityBlocks(accounts, username, colo) {
+  const blocks = /* @__PURE__ */ new Map();
+  await Promise.all((accounts || []).map(async (account) => {
+    if (!account?.id) return;
+    const blockedUntil = await getAccountEligibilityBlockUntil(username, account.id, colo);
+    if (blockedUntil > 0) blocks.set(account.id, blockedUntil);
+  }));
+  return blocks;
+}
+__name(getAccountEligibilityBlocks, "getAccountEligibilityBlocks");
+__name2(getAccountEligibilityBlocks, "getAccountEligibilityBlocks");
+function classifyGoogleEligibilityError(status, errorText) {
+  if (status !== 403) return null;
+  const text = String(errorText || "");
+  const lower = text.toLowerCase();
+  if (text.includes("3501") || lower.includes("valid license") || lower.includes("request-license")) {
+    return "region-3501";
+  }
+  if (
+    text.includes("-1-1008") ||
+    lower.includes("not currently available in your location") ||
+    (lower.includes("location") && (lower.includes("not eligible") || lower.includes("not currently available")))
+  ) {
+    return "location-1008";
+  }
+  return null;
+}
+__name(classifyGoogleEligibilityError, "classifyGoogleEligibilityError");
+__name2(classifyGoogleEligibilityError, "classifyGoogleEligibilityError");
+
 async function getAccountCooldownUntil(username, account, now = Math.floor(Date.now() / 1e3)) {
   const persistedUntil = Number(account?.cooldown_until) || 0;
   if (!username || !account?.id) return persistedUntil;
@@ -3468,14 +3967,17 @@ async function ensureValidAccountToken(account, mode, env, user, username, ctx) 
 __name(ensureValidAccountToken, "ensureValidAccountToken");
 __name2(ensureValidAccountToken, "ensureValidAccountToken");
 
-async function rankAccountsForRequest(accounts, resolvedModel, username, env) {
+async function rankAccountsForRequest(accounts, resolvedModel, username, env, colo = null) {
   if (!Array.isArray(accounts) || accounts.length === 0) return [];
   if (accounts.length === 1) return accounts.slice();
   const getAccountPriority = (account) => Math.min(100, Math.max(0, Number.isFinite(Number(account?.priority)) ? Number(account.priority) : 0));
   const now = Math.floor(Date.now() / 1e3);
   const scored = [];
   const quotaByAccountId = /* @__PURE__ */ new Map();
-  const cooldownByAccountId = await getAccountCooldowns(accounts, username);
+  const [cooldownByAccountId, eligibilityByAccountId] = await Promise.all([
+    getAccountCooldowns(accounts, username),
+    getAccountEligibilityBlocks(accounts, username, colo)
+  ]);
 
   // 配额只写入 isolate 内存 + Cache API（见 putTransientJsonCache），KV 从来不是
   // 配额的存储层，`quota:` KV 键只会被删除、不会被写入。因此这里改读同步内存缓存：
@@ -3494,9 +3996,13 @@ async function rankAccountsForRequest(accounts, resolvedModel, username, env) {
   for (const acc of accounts) {
     let score = 10000;
     const cooldownUntil = Math.max(Number(acc.cooldown_until) || 0, cooldownByAccountId.get(acc.id) || 0);
+    const eligibilityUntil = eligibilityByAccountId.get(acc.id) || 0;
     const inCooldown = cooldownUntil > now;
+    const eligibilityBlocked = eligibilityUntil > now;
 
-    if (inCooldown) {
+    if (eligibilityBlocked) {
+      score = -12000 - (eligibilityUntil - now);
+    } else if (inCooldown) {
       score = -10000 - (cooldownUntil - now);
     } else if (acc.status === "error") {
       score = -20000;
@@ -3525,7 +4031,9 @@ async function rankAccountsForRequest(accounts, resolvedModel, username, env) {
     scored.push({ account: acc, score, lastUsed, priority, isAvailable });
   }
 
-  // Availability first, then manual priority tier, then quota/status score, then LRU tie-breaker.
+  // Availability first, then strict manual priority tier, then quota/status
+  // score, then LRU tie-breaker. A known account-local eligibility block does
+  // not override the operator's explicit priority ordering.
   scored.sort((a, b) => b.isAvailable - a.isAvailable || b.priority - a.priority || b.score - a.score || a.lastUsed - b.lastUsed);
   return scored.map((s) => s.account);
 }
@@ -3647,9 +4155,20 @@ async function startGoogleAuth(request, env) {
   if (!hasOauthCredentials(oauthConfig)) {
     return new Response(`${mode} OAuth credentials are not configured`, { status: 503 });
   }
+  const requestedAccountId = url.searchParams.get("account_id");
+  let targetAccountId = null;
+  if (requestedAccountId) {
+    const user = await env.GEMINI_KV.get(`user:${username}`, "json");
+    const accounts = getUserAccounts(user);
+    const targetAccount = accounts.find((account) => account.id === requestedAccountId);
+    if (!targetAccount || targetAccount.mode !== mode) {
+      return new Response("Target account not found for this OAuth mode", { status: 400 });
+    }
+    targetAccountId = targetAccount.id;
+  }
   const state = generateRandomString(32);
   const { verifier, challenge } = await generatePKCE();
-  await env.GEMINI_KV.put(`oauth:${state}`, JSON.stringify({ username, verifier, mode }), { expirationTtl: 600 });
+  await env.GEMINI_KV.put(`oauth:${state}`, JSON.stringify({ username, verifier, mode, accountId: targetAccountId }), { expirationTtl: 600 });
   const params = new URLSearchParams({
     response_type: "code",
     client_id: oauthConfig.client_id,
@@ -3690,6 +4209,16 @@ async function handleGoogleCallback(request, env, ctx) {
     await env.GEMINI_KV.delete(`oauth:${state}`);
     return new Response("Invalid OAuth mode", { status: 400 });
   }
+  const requestedAccountId = oauthData.accountId || null;
+  let user = await env.GEMINI_KV.get(`user:${username}`, "json");
+  let accounts = getUserAccounts(user);
+  const requestedAccount = requestedAccountId
+    ? accounts.find((account) => account.id === requestedAccountId && account.mode === mode)
+    : null;
+  if (requestedAccountId && !requestedAccount) {
+    await env.GEMINI_KV.delete(`oauth:${state}`);
+    return new Response("Target account not found for this OAuth mode", { status: 400 });
+  }
   const oauthConfig = getOauthConfig(mode, env);
   if (!hasOauthCredentials(oauthConfig)) {
     return new Response(`${mode} OAuth credentials are not configured`, { status: 503 });
@@ -3711,6 +4240,7 @@ async function handleGoogleCallback(request, env, ctx) {
   const projectId = await ensureGeminiProject(tokenData.access_token, mode);
   let accountEmail = null;
   let accountName = null;
+  let accountSub = null;
   try {
     const userInfoRes = await fetch("https://www.googleapis.com/oauth2/v3/userinfo", {
       headers: { "Authorization": `Bearer ${tokenData.access_token}` }
@@ -3719,12 +4249,11 @@ async function handleGoogleCallback(request, env, ctx) {
       const userInfo = await userInfoRes.json();
       accountEmail = userInfo.email || null;
       accountName = userInfo.name || null;
+      accountSub = userInfo.sub || null;
     }
   } catch (e) {
     console.warn("[OAuth] Failed to fetch Google userinfo:", e.message || e);
   }
-  let user = await env.GEMINI_KV.get(`user:${username}`, "json");
-  const accounts = getUserAccounts(user);
   const tokenPayload = {
     access_token: tokenData.access_token,
     refresh_token: tokenData.refresh_token || "",
@@ -3732,8 +4261,27 @@ async function handleGoogleCallback(request, env, ctx) {
     project_id: projectId || ""
   };
   let targetAccount = null;
-  if (accountEmail) {
-    targetAccount = accounts.find((a) => a.mode === mode && a.email && a.email.toLowerCase() === accountEmail.toLowerCase());
+  if (requestedAccount) {
+    if (!accountEmail && !accountSub) {
+      await env.GEMINI_KV.delete(`oauth:${state}`);
+      return new Response("无法验证 Google 账号身份，原账号凭证未更改", { status: 400 });
+    }
+    const identityMatch = compareGoogleIdentity(
+      requestedAccount.email,
+      requestedAccount.google_sub,
+      accountEmail,
+      accountSub
+    );
+    if (identityMatch < 0) {
+      await env.GEMINI_KV.delete(`oauth:${state}`);
+      return new Response("授权的 Google 账号与目标账号不一致，原账号凭证未更改", { status: 400 });
+    }
+    targetAccount = requestedAccount;
+  } else if (accountEmail || accountSub) {
+    targetAccount = accounts.find((a) =>
+      a.mode === mode &&
+      compareGoogleIdentity(a.email, a.google_sub, accountEmail, accountSub) === 1
+    );
   }
   if (!targetAccount) {
     if (!tokenPayload.refresh_token) {
@@ -3746,6 +4294,7 @@ async function handleGoogleCallback(request, env, ctx) {
       id: "acc_" + generateRandomString(8),
       email: accountEmail || `${modeLabel} \u8D26\u53F7 ${modeCount}`,
       name: accountName || "",
+      google_sub: accountSub || "",
       mode,
       tokens: tokenPayload,
       enabled: true,
@@ -3762,6 +4311,8 @@ async function handleGoogleCallback(request, env, ctx) {
       tokenPayload.refresh_token = targetAccount.tokens.refresh_token;
     }
     targetAccount.tokens = tokenPayload;
+    if (accountEmail) targetAccount.email = accountEmail;
+    if (accountSub) targetAccount.google_sub = accountSub;
     if (accountName) targetAccount.name = accountName;
     targetAccount.status = "active";
     targetAccount.cooldown_until = 0;
@@ -3783,14 +4334,16 @@ async function handleGoogleCallback(request, env, ctx) {
 __name(handleGoogleCallback, "handleGoogleCallback");
 __name2(handleGoogleCallback, "handleGoogleCallback");
 async function ensureGeminiProject(accessToken, mode) {
-  const headers = { "Authorization": `Bearer ${accessToken}`, "Content-Type": "application/json" };
   if (mode === "antigravity") {
-    headers["User-Agent"] = "Antigravity/4.2.1 (Macintosh; Intel Mac OS X 10_15_7) Chrome/132.0.6834.160 Electron/39.2.3";
-  } else {
-    headers["User-Agent"] = HEADERS_CA["User-Agent"];
-    headers["X-Goog-Api-Client"] = HEADERS_CA["X-Goog-Api-Client"];
-    headers["Client-Metadata"] = HEADERS_CA["Client-Metadata"];
+    // Antigravity uses an empty project and its own model/quota endpoints. Do
+    // not call CodeAssist's loadCodeAssist/onboardUser flow here: that flow can
+    // return #3501 even when the OAuth account itself is healthy.
+    return null;
   }
+  const headers = { "Authorization": `Bearer ${accessToken}`, "Content-Type": "application/json" };
+  headers["User-Agent"] = HEADERS_CA["User-Agent"];
+  headers["X-Goog-Api-Client"] = HEADERS_CA["X-Goog-Api-Client"];
+  headers["Client-Metadata"] = HEADERS_CA["Client-Metadata"];
   const metadata = { ideType: "IDE_UNSPECIFIED", platform: "PLATFORM_UNSPECIFIED", pluginType: "GEMINI" };
   const loadRes = await fetch(`${GEMINI_ENDPOINT}/v1internal:loadCodeAssist`, {
     method: "POST",
@@ -3851,32 +4404,6 @@ async function antigravityQuotaFetchJson(url, accessToken, payload) {
 }
 __name(antigravityQuotaFetchJson, "antigravityQuotaFetchJson");
 __name2(antigravityQuotaFetchJson, "antigravityQuotaFetchJson");
-async function fetchAntigravityProjectInfo(accessToken) {
-  const result = await antigravityQuotaFetchJson(
-    `${ANTIGRAVITY_QUOTA_ENDPOINTS[0]}:loadCodeAssist`,
-    accessToken,
-    { metadata: { ideType: "ANTIGRAVITY" } }
-  );
-  if (!result.ok || !result.data) return { projectId: null, subscriptionTier: null };
-  const d = result.data;
-  const projectId = d.cloudaicompanionProject || null;
-  const isIneligible = Array.isArray(d.ineligibleTiers) && d.ineligibleTiers.length > 0;
-  let tier = d.paidTier?.name || d.paidTier?.id || null;
-  if (!tier) {
-    if (!isIneligible) {
-      tier = d.currentTier?.name || d.currentTier?.id || null;
-    } else {
-      const allowed = Array.isArray(d.allowedTiers) ? d.allowedTiers : [];
-      const defTier = allowed.find((t) => t.isDefault === true) || allowed[0] || null;
-      if (defTier) {
-        tier = (defTier.name || defTier.id || "UNKNOWN") + " (Restricted)";
-      }
-    }
-  }
-  return { projectId, subscriptionTier: tier };
-}
-__name(fetchAntigravityProjectInfo, "fetchAntigravityProjectInfo");
-__name2(fetchAntigravityProjectInfo, "fetchAntigravityProjectInfo");
 async function fetchAntigravityModels(accessToken, projectId) {
   const basePayload = projectId ? { project: projectId } : {};
   let lastErr = null;
@@ -4040,12 +4567,11 @@ async function fetchAccountAntigravityQuotaData(account, username, env, ctx, for
     accountChanged = true;
   }
   try {
-    const { projectId, subscriptionTier } = await fetchAntigravityProjectInfo(access_token);
-    if (projectId && projectId !== tokens.project_id) {
-      tokens.project_id = projectId;
-      account.tokens = tokens;
-      accountChanged = true;
-    }
+    // Antigravity's real model list and quota endpoints accept the agent route
+    // without a CodeAssist project. Keep this path free of loadCodeAssist so a
+    // healthy Antigravity account can never receive CodeAssist's #3501.
+    const projectId = "";
+    const subscriptionTier = null;
     const modelResult = await fetchAntigravityModels(access_token, projectId);
     if (modelResult.forbidden) {
       const forbiddenResult = {
@@ -4378,8 +4904,8 @@ __name2(handleAntigravityQuota, "handleAntigravityQuota");
 // 获取用户 Antigravity 模式的可用模型列表（OpenAI /v1/models 兼容格式）。
 // 模型 id 会套用用户配置的 antigravity_pattern（如 {modelname}-agy），保证可直接用于调用。
 // 获取失败（未绑定/403/网络错误/为空）时返回 null，由调用方决定回退策略。
-async function getAntigravityModelList(user, username, env, ctx) {
-  const result = await fetchAntigravityQuotaData(user, username, env, ctx, false);
+async function getAntigravityModelList(user, username, env, ctx, targetAccountId = null) {
+  const result = await fetchAntigravityQuotaData(user, username, env, ctx, false, targetAccountId);
   if (result.error || !result.data || result.data.is_forbidden) return null;
   const models = result.data.models || [];
   if (models.length === 0) return null;
@@ -4413,7 +4939,10 @@ async function handleModelsList(request, env, ctx, customPath) {
     "claude-3-5-sonnet-20241022",
     "claude-opus-4"
   ];
+  const url = new URL(request.url);
+  const requireReal = url.searchParams.get("real") === "1";
   const apiKey = extractApiKey(request);
+  const targetAccountId = url.searchParams.get("account_id");
   let username = null;
   if (apiKey) {
     username = await env.GEMINI_KV.get(`key:${apiKey}`);
@@ -4423,19 +4952,32 @@ async function handleModelsList(request, env, ctx, customPath) {
   if (username) {
     const user = await env.GEMINI_KV.get(`user:${username}`, "json");
     if (user) {
-      try {
-        const antigravityModels = await getAntigravityModelList(user, username, env, ctx);
-        if (antigravityModels && antigravityModels.length > 0) {
-          return jsonResponse({ object: "list", data: antigravityModels });
+      const targetAccount = targetAccountId
+        ? getUserAccounts(user).find((account) => account.id === targetAccountId)
+        : null;
+      if (targetAccount?.mode === "codeassist") {
+        if (requireReal) {
+          return jsonResponse({ error: "CodeAssist 已停用，无法返回真实模型列表" }, 503);
         }
-      } catch (e) {
-        console.warn(`[models] Failed to fetch antigravity model list for ${username}, falling back to static list:`, e.message || e);
+      } else {
+        try {
+          const antigravityModels = await getAntigravityModelList(user, username, env, ctx, targetAccountId);
+          if (antigravityModels && antigravityModels.length > 0) {
+            return jsonResponse({ object: "list", data: antigravityModels, source: "antigravity" });
+          }
+        } catch (e) {
+          console.warn(`[models] Failed to fetch antigravity model list for ${username}:`, e.message || e);
+        }
       }
     }
   }
+  if (requireReal) {
+    return jsonResponse({ error: "未能获取真实模型列表" }, 503);
+  }
   return jsonResponse({
     object: "list",
-    data: fallbackModels.map((m) => ({ id: m, object: "model", created: 1715644800, owned_by: "system" }))
+    data: fallbackModels.map((m) => ({ id: m, object: "model", created: 1715644800, owned_by: "system" })),
+    source: "fallback"
   });
 }
 __name(handleModelsList, "handleModelsList");
@@ -4488,6 +5030,7 @@ async function handleApiProxy(request, env, ctx, customPath, apiType) {
   if (apiType === "gemini" && !Array.isArray(body.contents)) {
     return jsonResponse({ error: "`contents` must be an array" }, 400);
   }
+  const requestColo = request?.cf?.colo || null;
   const sessionKey = getRequestSessionKey(body, request);
   const sessionId = deriveSessionId(`${username || "anonymous"}\u0000${inputModel}\u0000${sessionKey}`);
   const messageCount = responseFastPath?.messageCount || (body.messages ? body.messages.length : 1);
@@ -4497,9 +5040,10 @@ async function handleApiProxy(request, env, ctx, customPath, apiType) {
   let physicalModel = null;
   const agMatch = matchPattern(inputModel, antigravity_pattern);
   const caMatch = matchPattern(inputModel, caPattern);
-  if (agMatch) {
+  const hasAntigravitySuffix = inputModel.toLowerCase().endsWith("-agy");
+  if (agMatch || hasAntigravitySuffix) {
     mode = "antigravity";
-    physicalModel = agMatch;
+    physicalModel = agMatch || inputModel.slice(0, -4);
   } else if (caMatch) {
     mode = "codeassist";
     physicalModel = caMatch;
@@ -4511,18 +5055,37 @@ async function handleApiProxy(request, env, ctx, customPath, apiType) {
   const resolvedModel = physicalModel;
   const isClaudeModel = resolvedModel.toLowerCase().includes("claude");
   const allAccounts = getUserAccounts(user);
-  const candidateAccounts = allAccounts.filter((a) =>
-    a.mode === mode &&
-    a.enabled !== false &&
-    a.tokens &&
-    (a.tokens.access_token || a.tokens.refresh_token)
-  );
+  const requestedAccountId = new URL(request.url).searchParams.get("account_id");
+  let candidateAccounts;
+  if (requestedAccountId) {
+    const requestedAccount = allAccounts.find((a) =>
+      a.id === requestedAccountId &&
+      a.mode === mode &&
+      a.tokens &&
+      (a.tokens.access_token || a.tokens.refresh_token)
+    );
+    if (!requestedAccount) {
+      return jsonResponse({
+        error: `指定账号不可用或与模型模式不匹配: ${requestedAccountId}`
+      }, 400);
+    }
+    candidateAccounts = [requestedAccount];
+  } else {
+    candidateAccounts = allAccounts.filter((a) =>
+      a.mode === mode &&
+      a.enabled !== false &&
+      a.tokens &&
+      (a.tokens.access_token || a.tokens.refresh_token)
+    );
+  }
   if (candidateAccounts.length === 0) {
     return jsonResponse({
       error: `Google OAuth not configured for mode: ${mode}. Please add an account in the Dashboard.`
     }, 403);
   }
-  const sortedAccounts = await rankAccountsForRequest(candidateAccounts, resolvedModel, username, env);
+  const sortedAccounts = requestedAccountId
+    ? candidateAccounts
+    : await rankAccountsForRequest(candidateAccounts, resolvedModel, username, env, requestColo);
   const initialAccount = sortedAccounts[0];
   const isStream = body.stream === true || geminiRoute?.stream === true;
   let cloudCodePayload;
@@ -4535,35 +5098,7 @@ async function handleApiProxy(request, env, ctx, customPath, apiType) {
   let contentsHaveFunctionCalls = false;
   let systemInstructionText = "";
   let toolsPayload = void 0;
-  function extractImageFromBlock(blk) {
-    if (!blk || typeof blk !== "object") return null;
-    const blkType = (blk.type || "").toLowerCase();
-    if (blk.source && typeof blk.source === "object") {
-      const data = blk.source.data;
-      const mimeType = blk.source.media_type || "image/png";
-      if (data) {
-        return { inlineData: { mimeType, data } };
-      }
-    }
-    if (blkType.includes("image") && blk.data && typeof blk.data === "string") {
-      const mimeType = blk.mime_type || blk.media_type || blk.mimeType || "image/png";
-      return { inlineData: { mimeType, data: blk.data } };
-    }
-    let url = typeof blk.image_url === "string" ? blk.image_url : blk.image_url?.url || (blkType.includes("image") ? blk.url : null);
-    if (url && typeof url === "string") {
-      if (url.startsWith("data:")) {
-        const commaIdx = url.indexOf(",");
-        if (commaIdx !== -1) {
-          const mimeType = url.substring(5, url.indexOf(";")) || "image/png";
-          const data = url.substring(commaIdx + 1);
-          return { inlineData: { mimeType, data } };
-        }
-      } else {
-        return { fileData: { fileUri: url, mimeType: blk.media_type || "image/png" } };
-      }
-    }
-    return null;
-  }
+  // extractImageFromBlock is defined at module scope
   if (apiType === "openai" && responseFastPath) {
     systemInstructionText = responseFastPath.systemInstructionText;
     contents = responseFastPath.contents;
@@ -4586,7 +5121,7 @@ async function handleApiProxy(request, env, ctx, customPath, apiType) {
         // 场景（文件列表、JSON 代码块等）直接跳过 JSON.parse，避免对 100KB+
         // 文本做注定失败的全量解析。
         if (looksLikeBlockArray(t) && t.endsWith("]")) {
-          try { const parsed = JSON.parse(t); if (Array.isArray(parsed)) fm.content = parsed; } catch (e) {}
+          try { const parsed = safeParseJson(t); if (Array.isArray(parsed)) fm.content = parsed; } catch (e) {}
         }
       }
     }
@@ -4659,44 +5194,17 @@ async function handleApiProxy(request, env, ctx, customPath, apiType) {
         const name = m.name || toolIdToName[m.tool_call_id] || "unknown";
         const finalName = m.tool_call_id ? toolIdToName[m.tool_call_id] || name : name;
         const toolIdentity = decodeToolCallIdentity(m.tool_call_id);
-        if (Array.isArray(m.content)) {
-          const textParts = [];
-          const mediaParts = [];
-          for (const blk of m.content) {
-            if ((blk.type === "text" || blk.type === "input_text") && blk.text) {
-              textParts.push(typeof blk.text === "string" ? blk.text : JSON.stringify(blk.text));
-            } else {
-              const imgPart = extractImageFromBlock(blk);
-              if (imgPart) {
-                mediaParts.push(imgPart);
-              }
-            }
-          }
-          const responseBody = { result: textParts.join("\n") || "Image content attached" };
-          if (mediaParts.length > 0) {
-            responseBody.parts = mediaParts;
-          }
-          parts.push({
-            functionResponse: {
-              name: finalName,
-              response: responseBody,
-              id: toolIdentity.id || ""
-            }
-          });
-          if (mediaParts.length > 0) {
-            for (const mp of mediaParts) {
-              parts.push(mp);
-            }
-          }
-        } else {
-          parts.push({
-            functionResponse: {
-              name: finalName,
-              response: { result: m.content || "" },
-              id: toolIdentity.id || ""
-            }
-          });
+        const { textParts, mediaParts } = extractToolResultMediaAndText(m.content);
+        const resultText = textParts.join("\n") || (mediaParts.length > 0 ? "Image content attached" : (typeof m.content === "string" ? m.content : ""));
+        const funcResp = {
+          name: finalName,
+          response: { result: resultText },
+          id: toolIdentity.id || ""
+        };
+        if (mediaParts.length > 0) {
+          funcResp.parts = mediaParts;
         }
+        parts.push({ functionResponse: funcResp });
       }
       return {
         role: m.role === "assistant" ? "model" : "user",
@@ -4768,12 +5276,10 @@ async function handleApiProxy(request, env, ctx, customPath, apiType) {
               parts.push({ text: block.text });
             }
           } else if (block.type === "image" && block.source) {
-            parts.push({
-              inlineData: {
-                mimeType: block.source.media_type || "image/jpeg",
-                data: block.source.data || ""
-              }
-            });
+            // Structurally verified: a truncated/labelled-wrong image block here would
+            // otherwise fail the entire request upstream.
+            const imagePart = extractImageFromBlock(block);
+            if (imagePart) parts.push(imagePart);
           } else if (block.type === "tool_use") {
             contentsHaveFunctionCalls = true;
             let name = block.name;
@@ -4788,37 +5294,17 @@ async function handleApiProxy(request, env, ctx, customPath, apiType) {
             parts.push(funcPart);
           } else if (block.type === "tool_result") {
             const name = toolIdToName[block.tool_use_id] || "unknown";
-            let resultText = "";
-            if (typeof block.content === "string") {
-              resultText = block.content;
-            } else if (Array.isArray(block.content)) {
-              for (const rb of block.content) {
-                if ((rb.type === "text" || rb.type === "input_text" || rb.type === "output_text") && rb.text) {
-                  resultText += (resultText ? "\n" : "") + (typeof rb.text === "string" ? rb.text : JSON.stringify(rb.text));
-                } else if (rb.type === "image" && rb.source) {
-                  parts.push({ inlineData: { mimeType: rb.source.media_type || "image/jpeg", data: rb.source.data || "" } });
-                } else if (rb.type === "image_url" || rb.type === "input_image") {
-                  const imgUrl = typeof rb.image_url === "string" ? rb.image_url : rb.image_url?.url;
-                  if (imgUrl) {
-                    if (imgUrl.startsWith("data:")) {
-                      const commaIdx = imgUrl.indexOf(",");
-                      if (commaIdx !== -1) {
-                        parts.push({ inlineData: { mimeType: imgUrl.substring(5, imgUrl.indexOf(";")) || "image/jpeg", data: imgUrl.substring(commaIdx + 1) } });
-                      }
-                    } else {
-                      parts.push({ fileData: { fileUri: imgUrl, mimeType: rb.media_type || "image/jpeg" } });
-                    }
-                  }
-                }
-              }
+            const { textParts, mediaParts } = extractToolResultMediaAndText(block.content);
+            const resultText = textParts.join("\n") || (mediaParts.length > 0 ? "Image content attached" : (typeof block.content === "string" ? block.content : ""));
+            const funcResp = {
+              name,
+              response: { result: resultText },
+              id: block.tool_use_id || ""
+            };
+            if (mediaParts.length > 0) {
+              funcResp.parts = mediaParts;
             }
-            parts.push({
-              functionResponse: {
-                name,
-                response: { result: resultText },
-                id: block.tool_use_id || ""
-              }
-            });
+            parts.push({ functionResponse: funcResp });
           }
         }
         return parts;
@@ -4930,10 +5416,15 @@ async function handleApiProxy(request, env, ctx, customPath, apiType) {
     if (contents && Array.isArray(contents)) {
       if (!contentsHaveFunctionCalls) {
         innerRequest.contents = contents;
+      } else if (responseFastPath?.contentsAreAntigravityPrepared) {
+        // Responses conversion has already restored every real signature and
+        // verified unique call IDs. Re-running the full preparation pass here
+        // only clones hundreds of completed tool calls and burns CPU.
+        innerRequest.contents = contents;
       } else {
         const cachedSig = await getSessionSignature(env, sessionId);
         const actualIncludeThinking = shouldEnableThinking(body, resolvedModel, apiType);
-        innerRequest.contents = prepareAntigravityContents(contents, cachedSig, actualIncludeThinking, !!responseFastPath);
+        innerRequest.contents = prepareAntigravityContents(contents, cachedSig, actualIncludeThinking, true);
       }
     }
     const thinkingConfig = getUpstreamThinkingConfig(body, resolvedModel, apiType);
@@ -5020,6 +5511,7 @@ async function handleApiProxy(request, env, ctx, customPath, apiType) {
   let googleRes = null;
   let responseData = null;
   let sseLines = null;
+  let sseStream = null;
   const MAX_RETRIES = 3;
   // 单个客户端请求允许花在“等待后重试”上的累计时间。上游 429 的 Retry-After
   // 最长可到 30s，单账号（或故障转移后的最后一个账号）之前会把它按每次重试
@@ -5087,9 +5579,13 @@ async function handleApiProxy(request, env, ctx, customPath, apiType) {
   let successfulAccount = null;
   let finalGoogleRes = null;
   let lastAccountError = null;
-  for (let accIdx = 0; accIdx < sortedAccounts.length; accIdx++) {
-    const currentAccount = sortedAccounts[accIdx];
-    const hasNextAccount = accIdx + 1 < sortedAccounts.length;
+  let accountQueue = sortedAccounts.slice();
+  let recoveryRound = 0;
+  let lastTransient429Account = null;
+  let lastTransient429RetryAt = 0;
+  for (let accIdx = 0; accIdx < accountQueue.length; accIdx++) {
+    const currentAccount = accountQueue[accIdx];
+    const hasNextAccount = accIdx + 1 < accountQueue.length;
     const tokenRes = await ensureValidAccountToken(currentAccount, mode, env, user, username, ctx);
     if (tokenRes.changed) userStateDirty = true;
     if (!tokenRes.ok) {
@@ -5135,16 +5631,17 @@ async function handleApiProxy(request, env, ctx, customPath, apiType) {
     googleRes = null;
     responseData = null;
     sseLines = null;
+    sseStream = null;
     let accountSucceeded = false;
     let shouldFailoverToNext = false;
     for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
     // Set when an Antigravity 429 looked transient (quota unknown or > 0) so the
     // outer loop — not a nested retry storm — spends the remaining attempts.
     let antigravityRetryable429 = false;
-    const attemptPayload = buildAttemptPayload(cloudCodePayload, attempt, mode === "antigravity");
+    const attemptPayload = buildAttemptPayload(cloudCodePayload, attempt + recoveryRound, mode === "antigravity");
     try {
       const serializedAttemptPayload = serializeAttemptPayload(attemptPayload);
-      googleRes = await callUpstream(method, requestHeaders, attemptPayload, useStreamUpstream, serializedAttemptPayload);
+      googleRes = await callUpstream(method, requestHeaders, attemptPayload, useStreamUpstream, serializedAttemptPayload, mode, requestColo);
     } catch (err) {
       if (attempt === MAX_RETRIES) {
         lastAccountError = { error: err.message || String(err), status: 500 };
@@ -5159,123 +5656,139 @@ async function handleApiProxy(request, env, ctx, customPath, apiType) {
       continue;
     }
     if (!googleRes.ok) {
-      const status = googleRes.status;
-      if (status === 429 && mode === "antigravity") {
+      const currentStatus = googleRes.status;
+      if (currentStatus === 429 && mode === "antigravity") {
         if (hasNextAccount) {
-          const retryAfterSec = parseInt(googleRes.headers?.get("Retry-After") || "60", 10) || 60;
-          const cooldownUntil = Math.floor(Date.now() / 1e3) + Math.min(300, Math.max(30, retryAfterSec));
+          const retryAfterSec = parseInt(googleRes.headers?.get("Retry-After") || "5", 10) || 5;
+          const cooldownUntil = Math.floor(Date.now() / 1e3) + Math.min(300, Math.max(1, retryAfterSec));
           rememberAccountCooldown(username, currentAccount, cooldownUntil, ctx);
-          console.warn(`[Multi-Account Failover] Antigravity account '${currentAccount.email || currentAccount.id}' returned 429. Failing over to next account '${sortedAccounts[accIdx + 1].email || sortedAccounts[accIdx + 1].id}'...`);
+          lastTransient429Account = currentAccount;
+          lastTransient429RetryAt = cooldownUntil;
+          console.warn(`[Multi-Account Failover] Antigravity account '${currentAccount.email || currentAccount.id}' returned 429. Failing over to next account '${accountQueue[accIdx + 1].email || accountQueue[accIdx + 1].id}'...`);
           try { await googleRes.body?.cancel(); } catch (_) {}
           shouldFailoverToNext = true;
           break;
         }
         console.warn(`[429] entering recovery model=${resolvedModel} attempt=${attempt}/${MAX_RETRIES} requestId=${cloudCodePayload?.requestId || "none"} bytes=${basePayloadSerialized?.length || 0}`);
-        // 只读“已有”的配额：forceRefresh=true 会在这里补打配额接口，
-        // cacheOnly=true 连冷缓存的补齐也跳过。429 恢复阶段任何额外上游调用都是
-        // 纯粹的放大器，也是大请求触发 Cloudflare Error 1102（超出 CPU 预算）
-        // 的推手之一。
         const quotaData = await probeAntigravityQuotaExisting(currentAccount);
         const quotaPercentage = checkModelQuota(quotaData, resolvedModel);
-        // 配额接口可能暂时失败或不返回该模型。429 本身仍可能是短时节流，
-        // 因此“未知配额”也允许有限重试；只有明确报告 0% 时才直接返回。
-        // 重试交给外层 attempt 循环（每次都会换新 requestId）。此前这里再嵌套
-        // 一层 3 次重试，使单个客户端请求最多发出约 17 次上游调用，并对超长
-        // payload 反复序列化，正好把 isolate 的 CPU 预算耗尽并变成 1102。
         if (quotaPercentage === null || quotaPercentage > 0) {
           const quotaText = quotaPercentage === null ? "unknown" : `${quotaPercentage}%`;
           console.warn(`[429] Antigravity model '${resolvedModel}' returned 429 with ${quotaText} quota remaining. Retrying in the outer attempt loop (${MAX_RETRIES - attempt} attempt(s) left)...`);
           antigravityRetryable429 = true;
         }
       }
-      if (status === 429 && mode === "codeassist" && hasNextAccount) {
-        const retryAfterSec = parseInt(googleRes.headers?.get("Retry-After") || "60", 10) || 60;
-        const cooldownUntil = Math.floor(Date.now() / 1e3) + Math.min(300, Math.max(30, retryAfterSec));
+      if (currentStatus === 429 && mode === "codeassist" && hasNextAccount) {
+        const retryAfterSec = parseInt(googleRes.headers?.get("Retry-After") || "5", 10) || 5;
+        const cooldownUntil = Math.floor(Date.now() / 1e3) + Math.min(300, Math.max(1, retryAfterSec));
         rememberAccountCooldown(username, currentAccount, cooldownUntil, ctx);
         console.warn(`[Multi-Account Failover] CodeAssist account '${currentAccount.email || currentAccount.id}' returned 429. Failing over to next account...`);
         try { await googleRes.body?.cancel(); } catch (_) {}
         shouldFailoverToNext = true;
         break;
       }
-      if ((status === 401 || status === 403) && hasNextAccount) {
+      let errorText = "";
+      try {
+        if (googleRes && !googleRes.bodyUsed) {
+          errorText = await googleRes.text();
+        }
+      } catch (e) {
+        console.warn("[errorText] Failed to read response text:", e.message || e);
+      }
+      const eligibilityReason = classifyGoogleEligibilityError(currentStatus, errorText);
+      if (eligibilityReason) {
+        // Google may accept this account from one Cloudflare egress location and
+        // reject it from another. Keep the block local to account + colo so a
+        // blocked edge cannot poison healthy nodes globally.
+        rememberAccountEligibilityBlock(
+          username,
+          currentAccount,
+          requestColo,
+          eligibilityReason,
+          ctx,
+          300
+        );
+        console.warn(`[google-eligibility] account=${currentAccount.email || currentAccount.id} reason=${eligibilityReason} colo=${requestColo || "unknown"}`);
+      } else if (currentStatus === 401 || currentStatus === 403) {
         currentAccount.status = "error";
-        currentAccount.error_message = `${status} ${status === 401 ? "Unauthorized" : "Forbidden"}`;
+        currentAccount.error_message = `${currentStatus} ${currentStatus === 401 ? "Unauthorized" : "Forbidden"}`;
         userStateDirty = true;
-        console.warn(`[Multi-Account Failover] Account '${currentAccount.email || currentAccount.id}' returned ${status}. Failing over to next account...`);
-        try { await googleRes.body?.cancel(); } catch (_) {}
+      }
+      const retryableStatus = (currentStatus === 429 && (mode !== "antigravity" || antigravityRetryable429)) || currentStatus === 408 || currentStatus >= 500;
+      if (retryableStatus && attempt < MAX_RETRIES) {
+        const retryAfterSec = currentStatus === 429 ? parseInt(googleRes.headers?.get("Retry-After") || "", 10) : NaN;
+        const desiredWaitMs = Number.isFinite(retryAfterSec) && retryAfterSec > 0
+          ? Math.min(30, retryAfterSec) * 1000 + Math.floor(Math.random() * 500)
+          : 250 * attempt;
+        const allowedWaitMs = Math.min(desiredWaitMs, retryWaitBudgetMs);
+        if (allowedWaitMs > 0) {
+          retryWaitBudgetMs -= allowedWaitMs;
+          if (allowedWaitMs < desiredWaitMs) {
+            console.warn(`[retry] Wait budget capped a ${desiredWaitMs}ms backoff to ${allowedWaitMs}ms (HTTP ${currentStatus}).`);
+          }
+          await new Promise((r) => setTimeout(r, allowedWaitMs));
+          continue;
+        }
+        console.warn(`[retry] Wait budget exhausted (${RETRY_WAIT_BUDGET_MS}ms); returning HTTP ${currentStatus} without further retries.`);
+      }
+      const failoverStatus = currentStatus === 401 || currentStatus === 403 || currentStatus === 408 || currentStatus === 429 || currentStatus >= 500;
+      if (hasNextAccount && failoverStatus) {
+        console.warn(`[Multi-Account Failover] Account '${currentAccount.email || currentAccount.id}' returned ${currentStatus}${eligibilityReason ? ` (${eligibilityReason})` : ""}. Failing over to next account...`);
         shouldFailoverToNext = true;
         break;
       }
-      if (!googleRes.ok) {
-        const currentStatus = googleRes.status;
-        // 400 不在此列：确定性错误，重试只会重复失败并放大调用次数。
-        const retryableStatus = (currentStatus === 429 && (mode !== "antigravity" || antigravityRetryable429)) || currentStatus === 408 || currentStatus >= 500;
-        if (retryableStatus && attempt < MAX_RETRIES) {
-          // 429 优先尊重上游 Retry-After（上限 30s），其余可重试状态保持短退避；
-          // 两者都受本次请求的累计等待预算约束，预算用尽则直接返回上游错误。
-          const retryAfterSec = currentStatus === 429 ? parseInt(googleRes.headers?.get("Retry-After") || "", 10) : NaN;
-          const desiredWaitMs = Number.isFinite(retryAfterSec) && retryAfterSec > 0
-            ? Math.min(30, retryAfterSec) * 1000 + Math.floor(Math.random() * 500)
-            : 250 * attempt;
-          const allowedWaitMs = Math.min(desiredWaitMs, retryWaitBudgetMs);
-          if (allowedWaitMs > 0) {
-            retryWaitBudgetMs -= allowedWaitMs;
-            try {
-              await googleRes.body?.cancel();
-            } catch (e) {
-            }
-            if (allowedWaitMs < desiredWaitMs) {
-              console.warn(`[retry] Wait budget capped a ${desiredWaitMs}ms backoff to ${allowedWaitMs}ms (HTTP ${currentStatus}).`);
-            }
-            await new Promise((r) => setTimeout(r, allowedWaitMs));
-            continue;
+      if (!errorText) {
+        errorText = JSON.stringify({
+          error: {
+            message: `Upstream returned HTTP ${currentStatus}`,
+            code: currentStatus
           }
-          console.warn(`[retry] Wait budget exhausted (${RETRY_WAIT_BUDGET_MS}ms); returning HTTP ${currentStatus} without further retries.`);
-        }
-        if (hasNextAccount && (currentStatus === 401 || currentStatus === 403 || currentStatus === 408 || currentStatus === 429 || currentStatus >= 500)) {
-          try { await googleRes.body?.cancel(); } catch (_) {}
-          shouldFailoverToNext = true;
-          break;
-        }
-        let errorText = "";
-        try {
-          if (googleRes && !googleRes.bodyUsed) {
-            errorText = await googleRes.text();
-          }
-        } catch (e) {
-          console.warn("[errorText] Failed to read response text:", e.message || e);
-        }
-        if (!errorText) {
-          errorText = JSON.stringify({
-            error: {
-              message: `Upstream returned HTTP ${currentStatus}`,
-              code: currentStatus
-            }
-          });
-        }
-        lastAccountError = {
-          response: new Response(errorText, {
-            status: currentStatus,
-            headers: {
-              "Content-Type": googleRes.headers.get("Content-Type") || "application/json;charset=utf-8",
-              "Access-Control-Allow-Origin": "*",
-              "Access-Control-Allow-Headers": "*",
-              "Access-Control-Allow-Methods": "*"
-            }
-          })
-        };
-        if (hasNextAccount) {
-          shouldFailoverToNext = true;
-          break;
-        }
-        await persistUserIfDirty();
-        return lastAccountError.response;
+        });
       }
+      lastAccountError = {
+        response: new Response(errorText, {
+          status: currentStatus,
+          headers: {
+            "Content-Type": googleRes.headers.get("Content-Type") || "application/json;charset=utf-8",
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Headers": "*",
+            "Access-Control-Allow-Methods": "*"
+          }
+        })
+      };
+      if (!hasNextAccount && recoveryRound === 0 && lastTransient429Account) {
+        const desiredWaitMs = Math.max(0, lastTransient429RetryAt * 1000 - Date.now());
+        const allowedWaitMs = Math.min(desiredWaitMs || 1000, retryWaitBudgetMs, 10000);
+        if (allowedWaitMs <= 0) {
+          console.warn(`[account-recovery] Wait budget exhausted; returning final candidate error ${currentStatus}.`);
+          await persistUserIfDirty();
+          return lastAccountError.response;
+        }
+        retryWaitBudgetMs -= allowedWaitMs;
+        console.warn(`[account-recovery] Retrying transient 429 account '${lastTransient429Account.email || lastTransient429Account.id}' after ${allowedWaitMs}ms; final candidate returned ${currentStatus}${eligibilityReason ? ` (${eligibilityReason})` : ""}.`);
+        await new Promise((r) => setTimeout(r, allowedWaitMs));
+        accountQueue = [lastTransient429Account];
+        accIdx = -1;
+        recoveryRound = 1;
+        shouldFailoverToNext = true;
+        break;
+      }
+      await persistUserIfDirty();
+      return lastAccountError.response;
     }
+
     if (useStreamUpstream) {
-      const sseResult = await readSseLines(googleRes.body);
-      sseLines = sseResult.lines;
-      if (!sseResult.hasAnyContent) {
+      let sseHasAnyContent = false;
+      if (responseProtocol) {
+        const peeked = await peekResponsesSseUntilMeaningful(googleRes.body);
+        sseStream = peeked.stream;
+        sseHasAnyContent = peeked.hasAnyContent;
+      } else {
+        const sseResult = await readSseLines(googleRes.body);
+        sseLines = sseResult.lines;
+        sseHasAnyContent = sseResult.hasAnyContent;
+      }
+      if (!sseHasAnyContent) {
         console.warn(`Upstream returned empty SSE stream (attempt ${attempt}/${MAX_RETRIES})`);
         if (attempt === MAX_RETRIES) {
           if (hasNextAccount) {
@@ -5353,6 +5866,7 @@ async function handleApiProxy(request, env, ctx, customPath, apiType) {
       currentAccount.last_used_at = Math.floor(Date.now() / 1e3);
       currentAccount.cooldown_until = 0;
       clearAccountCooldown(username, currentAccount.id, ctx);
+      clearAccountEligibilityBlock(username, currentAccount.id, requestColo, ctx);
       recordAccountUsage(username, currentAccount, currentAccount.last_used_at);
       if (userStateDirty) {
         ctx.waitUntil(persistUserIfDirty());
@@ -5371,12 +5885,14 @@ async function handleApiProxy(request, env, ctx, customPath, apiType) {
   if (isStream) {
     const { readable, writable } = new TransformStream();
     if (responseProtocol) {
-      ctx.waitUntil((async () => {
+      // 流式生产者必须在 Response 生命周期内运行（不使用 ctx.waitUntil），
+      // 否则 Cloudflare 可能在 writable 关闭前提前结束请求，导致下游收到截断流。
+      (async () => {
         try {
           if (!useStreamUpstream) {
             await streamResponsesSimulatedResponse(responseData, writable, inputModel, mode, env, sessionId, messageCount, ctx);
           } else {
-            await processResponsesStreamLines(sseLines, writable, inputModel, mode, env, sessionId, messageCount, ctx);
+            await processResponsesSseStream(sseStream, writable, inputModel, mode);
           }
         } catch (e) {
           try {
@@ -5384,12 +5900,12 @@ async function handleApiProxy(request, env, ctx, customPath, apiType) {
             await w.close();
           } catch (_) {}
         }
-      })());
+      })();
     } else if (!useStreamUpstream) {
       // Antigravity + Claude：上游非流式，本地模拟流式
       const writer = writable.getWriter();
       const encoder = new TextEncoder();
-      ctx.waitUntil((async () => {
+      (async () => {
         try {
           await streamSimulatedResponse(responseData, apiType, inputModel, writer, encoder, env, sessionId, messageCount, ctx);
         } catch (e) {
@@ -5398,10 +5914,10 @@ async function handleApiProxy(request, env, ctx, customPath, apiType) {
           } catch (_) {
           }
         }
-      })());
+      })();
     } else {
       // codeassist 或 antigravity+Gemini：真 SSE 流式
-      ctx.waitUntil((async () => {
+      (async () => {
         try {
           await processStreamLines(sseLines, writable, apiType, inputModel, env, sessionId, messageCount, ctx);
         } catch (e) {
@@ -5411,7 +5927,7 @@ async function handleApiProxy(request, env, ctx, customPath, apiType) {
           } catch (_) {
           }
         }
-      })());
+      })();
     }
     return new Response(readable, {
       headers: {

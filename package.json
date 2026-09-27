@@ -4,11 +4,12 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "check": "node --check src/worker.js",
+    "check": "node --check src/worker.js && node --check src/responses-stream.js && node --check api/vercel-kv.js && node --check api/vercel-runtime.js && node --check api/handler.js && node --check api/server.js",
     "test": "node scripts/run-tests.mjs",
     "deploy": "wrangler deploy",
+    "deploy:vercel": "node scripts/deploy-to-vercel.mjs",
     "dev": "wrangler dev",
-    "start": "wrangler dev"
+    "start": "node api/server.js"
   },
   "devDependencies": {
     "wrangler": "^4.107.0"

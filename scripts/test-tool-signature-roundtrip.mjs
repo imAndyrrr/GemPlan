@@ -20,6 +20,14 @@ function extract(name) {
   return src.slice(start, i + 1);
 }
 
+function extractVarObject(name) {
+  const start = src.indexOf(`var ${name} = {`);
+  if (start === -1) throw new Error(`${name} not found`);
+  const end = src.indexOf("};", start);
+  if (end === -1) throw new Error(`${name} not terminated`);
+  return src.slice(start, end + 2);
+}
+
 const code = `
 const __name = (f) => f;
 const __name2 = (f) => f;
@@ -28,6 +36,20 @@ ${extract("decodeToolCallIdentity")}
 ${extract("hasNonWhitespace")}
 ${extract("responseContentToGeminiParts")}
 ${extract("responseOutputToGeminiText")}
+${extract("safeParseJson")}
+${extract("normalizeBase64Data")}
+${extract("decodeBase64Window")}
+${extract("readImageBytes")}
+${extract("base64ByteLength")}
+${extract("be32")}
+${extract("le32")}
+${extract("detectImageFormat")}
+${extract("heifBoxesComplete")}
+${extract("imagePayloadComplete")}
+${extractVarObject("IMAGE_FORMAT_MIME")}
+${extract("inspectImagePayload")}
+${extract("extractImageFromBlock")}
+${extract("extractToolResultMediaAndText")}
 ${extract("responsesRequestToGeminiRequest")}
 ${extract("prepareAntigravityContents")}
 globalThis.__fns = {
