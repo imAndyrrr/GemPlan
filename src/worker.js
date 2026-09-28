@@ -3909,38 +3909,58 @@ __name2(saveUser, "saveUser");
 async function refreshAccountToken(account, mode, env) {
   const tokens = account?.tokens;
   if (!tokens || !tokens.refresh_token) {
-    return { ok: false, error: "Missing refresh token" };
+    return { ok: false, error: "Missing refresh token", isAuthError: true };
   }
   const oauthConfig = getOauthConfig(mode, env);
   if (!hasOauthCredentials(oauthConfig)) {
-    return { ok: false, error: `${mode} OAuth credentials are not configured` };
+    return { ok: false, error: `${mode} OAuth credentials are not configured`, isAuthError: true };
   }
-  try {
-    const tokenRes = await fetch("https://oauth2.googleapis.com/token", {
-      method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: new URLSearchParams({
-        grant_type: "refresh_token",
-        refresh_token: tokens.refresh_token,
-        client_id: oauthConfig.client_id,
-        client_secret: oauthConfig.client_secret
-      })
-    });
-    if (!tokenRes.ok) {
-      const errText = await tokenRes.text().catch(() => "");
-      return { ok: false, error: `HTTP ${tokenRes.status}: ${errText}` };
+  let lastError = null;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    if (attempt > 0) {
+      await new Promise((r) => setTimeout(r, 600 * attempt));
     }
-    const td = await tokenRes.json();
-    tokens.access_token = td.access_token;
-    if (td.refresh_token) {
-      tokens.refresh_token = td.refresh_token;
+    try {
+      const tokenRes = await fetch("https://oauth2.googleapis.com/token", {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({
+          grant_type: "refresh_token",
+          refresh_token: tokens.refresh_token,
+          client_id: oauthConfig.client_id,
+          client_secret: oauthConfig.client_secret
+        })
+      });
+      if (!tokenRes.ok) {
+        const errText = await tokenRes.text().catch(() => "");
+        let errJson = null;
+        try { errJson = JSON.parse(errText); } catch (_) {}
+        const errorKey = errJson?.error || "";
+        if (tokenRes.status === 400 || tokenRes.status === 401) {
+          if (errorKey === "invalid_grant" || errorKey === "unauthorized_client") {
+            return { ok: false, error: `Google OAuth Error: ${errorKey}`, isAuthError: true };
+          }
+        }
+        lastError = `HTTP ${tokenRes.status}: ${errText}`;
+        continue;
+      }
+      const td = await tokenRes.json();
+      if (!td.access_token) {
+        lastError = "Response missing access_token";
+        continue;
+      }
+      tokens.access_token = td.access_token;
+      if (td.refresh_token) {
+        tokens.refresh_token = td.refresh_token;
+      }
+      tokens.expires_at = Math.floor(Date.now() / 1e3) + (td.expires_in || 3600);
+      account.tokens = tokens;
+      return { ok: true, tokens };
+    } catch (e) {
+      lastError = e.message || String(e);
     }
-    tokens.expires_at = Math.floor(Date.now() / 1e3) + (td.expires_in || 3600);
-    account.tokens = tokens;
-    return { ok: true, tokens };
-  } catch (e) {
-    return { ok: false, error: e.message || String(e) };
   }
+  return { ok: false, error: lastError || "Token refresh failed after retries", isAuthError: false };
 }
 __name(refreshAccountToken, "refreshAccountToken");
 __name2(refreshAccountToken, "refreshAccountToken");
@@ -3948,15 +3968,17 @@ __name2(refreshAccountToken, "refreshAccountToken");
 async function ensureValidAccountToken(account, mode, env, user, username, ctx) {
   const tokens = account?.tokens;
   if (!tokens || (!tokens.access_token && !tokens.refresh_token)) {
-    return { ok: false, error: "No tokens present for account" };
+    return { ok: false, error: "No tokens present for account", isAuthError: true };
   }
   const now = Math.floor(Date.now() / 1e3);
   if (!tokens.access_token || now + 60 >= (tokens.expires_at || 0)) {
     const refreshed = await refreshAccountToken(account, mode, env);
     if (!refreshed.ok) {
-      account.status = "error";
-      account.error_message = refreshed.error;
-      return { ...refreshed, changed: true };
+      if (refreshed.isAuthError) {
+        account.status = "error";
+        account.error_message = refreshed.error;
+      }
+      return { ...refreshed, changed: !!refreshed.isAuthError };
     }
     account.status = "active";
     account.error_message = null;
@@ -4536,34 +4558,24 @@ async function fetchAccountAntigravityQuotaData(account, username, env, ctx, for
   }
   let { access_token, refresh_token, expires_at } = tokens;
   if (Math.floor(Date.now() / 1e3) + 60 >= (expires_at || 0)) {
-    const oauthConfig = getOauthConfig("antigravity", env);
-    const tokenRes = await fetch("https://oauth2.googleapis.com/token", {
-      method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: new URLSearchParams({
-        grant_type: "refresh_token",
-        refresh_token,
-        client_id: oauthConfig.client_id,
-        client_secret: oauthConfig.client_secret
-      })
-    });
-    if (!tokenRes.ok) {
-      account.status = "error";
-      account.error_message = "Token refresh failed";
+    const refreshed = await refreshAccountToken(account, "antigravity", env);
+    if (!refreshed.ok) {
+      if (refreshed.isAuthError) {
+        account.status = "error";
+        account.error_message = refreshed.error;
+        return {
+          error: "Antigravity Token \u5DF2\u8FC7\u671F\u4E14\u5237\u65B0\u5931\u8D25\uFF0C\u8BF7\u91CD\u65B0\u5728\u63A7\u5236\u53F0\u5B8C\u6210\u6388\u6743",
+          status: 401,
+          account_changed: true
+        };
+      }
       return {
-        error: "Antigravity Token \u5DF2\u8FC7\u671F\u4E14\u5237\u65B0\u5931\u8D25\uFF0C\u8BF7\u91CD\u65B0\u5728\u63A7\u5236\u53F0\u5B8C\u6210\u6388\u6743",
-        status: 401,
-        account_changed: true
+        error: `Antigravity Token \u5237\u65B0\u6682\u65F6\u5931\u8D25 (${refreshed.error})\uFF0C\u8BF7\u7A0D\u540E\u91CD\u8BD5`,
+        status: 503,
+        account_changed: false
       };
     }
-    const td = await tokenRes.json();
-    access_token = td.access_token;
-    tokens.access_token = access_token;
-    tokens.refresh_token = td.refresh_token || refresh_token;
-    tokens.expires_at = Math.floor(Date.now() / 1e3) + (td.expires_in || 3600);
-    account.tokens = tokens;
-    account.status = "active";
-    account.error_message = null;
+    access_token = refreshed.tokens.access_token;
     accountChanged = true;
   }
   try {
@@ -5590,13 +5602,19 @@ async function handleApiProxy(request, env, ctx, customPath, apiType) {
     if (tokenRes.changed) userStateDirty = true;
     if (!tokenRes.ok) {
       console.warn(`[Multi-Account] Account ${currentAccount.email || currentAccount.id} token invalid: ${tokenRes.error}`);
-      currentAccount.status = "error";
-      currentAccount.error_message = tokenRes.error;
+      if (tokenRes.isAuthError) {
+        currentAccount.status = "error";
+        currentAccount.error_message = tokenRes.error;
+      }
       if (hasNextAccount) {
         continue;
       }
       await persistUserIfDirty();
-      return jsonResponse({ error: `Token refresh failed for mode ${mode}. Please re-auth in Dashboard.` }, 401);
+      if (tokenRes.isAuthError) {
+        return jsonResponse({ error: `Token refresh failed for mode ${mode}. Please re-auth in Dashboard.` }, 401);
+      } else {
+        return jsonResponse({ error: `Token refresh temporarily unavailable: ${tokenRes.error}` }, 503);
+      }
     }
     const curToken = currentAccount.tokens.access_token;
     requestHeaders["Authorization"] = `Bearer ${curToken}`;
