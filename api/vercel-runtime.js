@@ -2,7 +2,7 @@ import { Readable } from "node:stream";
 import { once } from "node:events";
 import fs from "node:fs";
 import path from "node:path";
-import { createMemoryOrRestKV, createRestCache } from "./vercel-kv.js";
+import { createMemoryOrRestKV, createRestCache, MemoryKV } from "./vercel-kv.js";
 
 function loadLocalEnvFile() {
   const loaded = {};
@@ -81,11 +81,45 @@ export function toWebRequest(req) {
   return request;
 }
 
+class CachedKvWrapper {
+  constructor(kv) {
+    this.kv = kv;
+    this.mem = new Map();
+  }
+  async get(key, type) {
+    if (typeof key === "string" && (key.startsWith("user:") || key.startsWith("key:") || key.startsWith("path:"))) {
+      const hit = this.mem.get(key);
+      if (hit && hit.expiresAt > Date.now()) {
+        return type === "json" ? (typeof hit.val === "string" ? JSON.parse(hit.val) : structuredClone(hit.val)) : hit.val;
+      }
+    }
+    const val = await this.kv.get(key, type);
+    if (val !== null && val !== undefined && typeof key === "string" && (key.startsWith("user:") || key.startsWith("key:") || key.startsWith("path:"))) {
+      this.mem.set(key, { val, expiresAt: Date.now() + 60000 });
+    }
+    return val;
+  }
+  async put(key, value, options) {
+    if (typeof key === "string") this.mem.delete(key);
+    return this.kv.put(key, value, options);
+  }
+  async delete(key) {
+    if (typeof key === "string") this.mem.delete(key);
+    return this.kv.delete(key);
+  }
+  async list(options) {
+    return this.kv.list(options);
+  }
+}
+
 export function createRuntimeEnvironment(source = process.env) {
   const fileEnv = loadLocalEnvFile();
   const env = { ...fileEnv, ...source };
-  env.GEMINI_KV = createMemoryOrRestKV(env);
-  const cache = createRestCache(env.GEMINI_KV);
+  const rawKv = createMemoryOrRestKV(env);
+  env.GEMINI_KV = new CachedKvWrapper(rawKv);
+  // 临时缓存（思考签名、403 cooldown、临时状态）使用纯内存，严禁向远程 Cloudflare KV 刷写入配额
+  const cacheKv = new MemoryKV();
+  const cache = createRestCache(cacheKv);
   Object.defineProperty(globalThis, "caches", {
     value: { default: cache },
     configurable: true,
