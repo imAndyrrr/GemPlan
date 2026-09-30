@@ -147,8 +147,25 @@ export function createRuntimeContext() {
 async function writeBody(webResponse, res) {
   if (!webResponse.body) return;
   const stream = Readable.fromWeb(webResponse.body);
-  for await (const chunk of stream) {
-    if (!res.write(chunk)) await once(res, "drain");
+  const onResClose = () => {
+    try { stream.destroy(); } catch (_) {}
+  };
+  res.on("close", onResClose);
+  try {
+    for await (const chunk of stream) {
+      if (res.destroyed || res.writableEnded) break;
+      if (!res.write(chunk)) {
+        await Promise.race([
+          once(res, "drain"),
+          once(res, "close")
+        ]);
+      }
+    }
+  } catch (err) {
+    if (err?.code !== "ERR_STREAM_DESTROYED") throw err;
+  } finally {
+    res.off("close", onResClose);
+    try { stream.destroy(); } catch (_) {}
   }
 }
 

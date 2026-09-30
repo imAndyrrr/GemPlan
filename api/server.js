@@ -19,6 +19,10 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
+// Keep-alive timeout tuned for upstream proxies (Render / Cloudflare / Nginx) to prevent ECONNRESET
+server.keepAliveTimeout = 65000;
+server.headersTimeout = 66000;
+
 server.listen(port, host, () => {
   console.log(`[gemplan] Server listening on http://${host}:${port}`);
 });

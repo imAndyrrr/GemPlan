@@ -26,16 +26,20 @@ var ANTIGRAVITY_OAUTH = {
 };
 function getOauthConfig(mode, env) {
   if (mode === "antigravity") {
+    const rawId = env?.ANTIGRAVITY_CLIENT_ID || (typeof process !== "undefined" ? process.env?.ANTIGRAVITY_CLIENT_ID : "");
+    const rawSecret = env?.ANTIGRAVITY_CLIENT_SECRET || (typeof process !== "undefined" ? process.env?.ANTIGRAVITY_CLIENT_SECRET : "");
     return {
-      client_id: String(env?.ANTIGRAVITY_CLIENT_ID || "").trim(),
-      client_secret: String(env?.ANTIGRAVITY_CLIENT_SECRET || "").trim(),
+      client_id: String(rawId || "").trim(),
+      client_secret: String(rawSecret || "").trim(),
       redirect_uri: env?.ANTIGRAVITY_REDIRECT_URI || ANTIGRAVITY_OAUTH.redirect_uri,
       scopes: ANTIGRAVITY_OAUTH.scopes
     };
   } else {
+    const rawId = env?.CODEASSIST_CLIENT_ID || (typeof process !== "undefined" ? process.env?.CODEASSIST_CLIENT_ID : "");
+    const rawSecret = env?.CODEASSIST_CLIENT_SECRET || (typeof process !== "undefined" ? process.env?.CODEASSIST_CLIENT_SECRET : "");
     return {
-      client_id: String(env?.CODEASSIST_CLIENT_ID || "").trim(),
-      client_secret: String(env?.CODEASSIST_CLIENT_SECRET || "").trim(),
+      client_id: String(rawId || "").trim(),
+      client_secret: String(rawSecret || "").trim(),
       redirect_uri: env?.CODEASSIST_REDIRECT_URI || CODEASSIST_OAUTH.redirect_uri,
       scopes: CODEASSIST_OAUTH.scopes
     };
@@ -3906,11 +3910,19 @@ async function saveUser(env, user, username) {
 __name(saveUser, "saveUser");
 __name2(saveUser, "saveUser");
 
+const tokenRefreshInFlight = new Map();
+
 async function refreshAccountToken(account, mode, env) {
   const tokens = account?.tokens;
   if (!tokens || !tokens.refresh_token) {
     return { ok: false, error: "Missing refresh token", isAuthError: true };
   }
+  const inFlightKey = `${mode}:${account.id || tokens.refresh_token}`;
+  const existing = tokenRefreshInFlight.get(inFlightKey);
+  if (existing) {
+    return existing;
+  }
+  const refreshPromise = (async () => {
   const oauthConfig = getOauthConfig(mode, env);
   if (!hasOauthCredentials(oauthConfig)) {
     return { ok: false, error: `${mode} OAuth credentials are not configured`, isAuthError: true };
@@ -3961,6 +3973,13 @@ async function refreshAccountToken(account, mode, env) {
     }
   }
   return { ok: false, error: lastError || "Token refresh failed after retries", isAuthError: false };
+  })();
+  tokenRefreshInFlight.set(inFlightKey, refreshPromise);
+  try {
+    return await refreshPromise;
+  } finally {
+    tokenRefreshInFlight.delete(inFlightKey);
+  }
 }
 __name(refreshAccountToken, "refreshAccountToken");
 __name2(refreshAccountToken, "refreshAccountToken");
