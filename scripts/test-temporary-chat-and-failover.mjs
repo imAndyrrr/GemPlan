@@ -442,6 +442,112 @@ try {
     assert.notEqual(highRequestIds[0], highRequestIds.at(-1));
     console.log("PASS: transient 429 is retried after a terminal account-local 403 without leaking the error");
   }
+
+  {
+    // 401 自动强制刷新 Token 并原地重试成功
+    const user = makeUser([
+      makeAccount("acc-401-refresh", { priority: 100 })
+    ]);
+    const kv = new MockKV({
+      "key:sk-runtime-test": "user-401",
+      "user:user-401": JSON.stringify(user)
+    });
+    const env = {
+      GEMINI_KV: kv,
+      ANTIGRAVITY_CLIENT_ID: "mock-client-id",
+      ANTIGRAVITY_CLIENT_SECRET: "mock-client-secret"
+    };
+    let oauthRefreshed = false;
+    let attemptsMade = [];
+    globalThis.fetch = async (url, init = {}) => {
+      const urlStr = String(url);
+      if (urlStr.includes("oauth2.googleapis.com/token")) {
+        oauthRefreshed = true;
+        return new Response(JSON.stringify({
+          access_token: "new-refreshed-token",
+          expires_in: 3600
+        }), { status: 200, headers: { "Content-Type": "application/json" } });
+      }
+      const auth = init.headers?.Authorization || init.headers?.authorization || "";
+      attemptsMade.push(auth);
+      if (auth === "Bearer token-acc-401-refresh") {
+        return new Response(JSON.stringify({ error: { message: "Invalid Credentials", code: 401 } }), {
+          status: 401,
+          headers: { "Content-Type": "application/json" }
+        });
+      }
+      if (auth === "Bearer new-refreshed-token") {
+        return successResponse("401-refresh-success");
+      }
+      throw new Error(`unexpected request: ${auth} to ${urlStr}`);
+    };
+
+    const ctx = makeCtx();
+    const response = await worker.fetch(chatRequest(), env, ctx);
+    await ctx.drain();
+    const data = await response.json();
+    assert.equal(response.status, 200);
+    assert.equal(data.choices[0].message.content, "401-refresh-success");
+    assert.equal(oauthRefreshed, true);
+    assert.deepEqual(attemptsMade, [
+      "Bearer token-acc-401-refresh",
+      "Bearer new-refreshed-token"
+    ]);
+    const savedUser = JSON.parse(await kv.get("user:user-401"));
+    const target = savedUser.accounts.find((a) => a.id === "acc-401-refresh");
+    assert.equal(target.status, "active");
+    assert.equal(target.error_message, null);
+    assert.equal(target.tokens.access_token, "new-refreshed-token");
+    console.log("PASS: 401 Unauthorized triggers forced token refresh and succeeds on in-place retry");
+  }
+
+  {
+    // 账号管理 API action: recheck 验证恢复
+    const user = makeUser([
+      makeAccount("acc-to-recheck", {
+        status: "error",
+        error_message: "401 Unauthorized"
+      })
+    ]);
+    const kv = new MockKV({
+      "session:sess-recheck": "user-recheck",
+      "user:user-recheck": JSON.stringify(user)
+    });
+    const env = {
+      GEMINI_KV: kv,
+      ANTIGRAVITY_CLIENT_ID: "mock-client-id",
+      ANTIGRAVITY_CLIENT_SECRET: "mock-client-secret"
+    };
+    globalThis.fetch = async (url) => {
+      if (String(url).includes("oauth2.googleapis.com/token")) {
+        return new Response(JSON.stringify({
+          access_token: "verified-token",
+          expires_in: 3600
+        }), { status: 200, headers: { "Content-Type": "application/json" } });
+      }
+      throw new Error("unexpected fetch in recheck");
+    };
+    const recheckReq = new Request("http://localhost/api/user/account", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Cookie": "session_id=sess-recheck"
+      },
+      body: JSON.stringify({ action: "recheck", id: "acc-to-recheck" })
+    });
+    const ctx = makeCtx();
+    const res = await worker.fetch(recheckReq, env, ctx);
+    await ctx.drain();
+    const resData = await res.json();
+    assert.equal(res.status, 200);
+    assert.equal(resData.success, true);
+    const savedUser = JSON.parse(await kv.get("user:user-recheck"));
+    const target = savedUser.accounts.find((a) => a.id === "acc-to-recheck");
+    assert.equal(target.status, "active");
+    assert.equal(target.error_message, null);
+    assert.equal(target.tokens.access_token, "verified-token");
+    console.log("PASS: account API recheck restores error account to active state");
+  }
 } finally {
   globalThis.fetch = originalFetch;
 }

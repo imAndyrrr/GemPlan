@@ -3083,6 +3083,7 @@ async function handleDashboard(request, env) {
                   <input type="number" min="0" max="100" step="1" value="${Math.min(100, Math.max(0, Number.isFinite(Number(acc.priority)) ? Number(acc.priority) : 0))}" onchange="setAccountPriority('${acc.id}', this.value)" style="width:58px; padding:4px 6px; margin:0; font-size:12px;">
                 </label>
                 ${acc.status === "error" ? `<button class="btn-sm" data-reauthorize-mode="${escapeHtml(acc.mode)}" data-reauthorize-account="${escapeHtml(acc.id)}" onclick="reauthorizeAccount(this.dataset.reauthorizeMode, this.dataset.reauthorizeAccount)" style="background:#6f42c1;">重新授权</button>` : ''}
+                ${acc.status === "error" && acc.tokens && acc.tokens.refresh_token ? `<button class="btn-sm" onclick="recheckAccount('${acc.id}')" style="background:#17a2b8;">检测恢复</button>` : ''}
                 <button class="btn-sm" onclick="toggleAccount('${acc.id}', ${acc.enabled === false})" style="background:${acc.enabled !== false ? '#6c757d' : '#28a745'};">${acc.enabled !== false ? '\u7981\u7528' : '\u542F\u7528'}</button>
                 ${isCooling ? `<button class="btn-sm" onclick="resetAccountCooldown('${acc.id}')" style="background:#fd7e14;">\u89E3\u9664\u51B7\u5374</button>` : ''}
                 <button class="btn-sm" onclick="deleteAccount('${acc.id}')" style="background:#dc3545;">\u5220\u9664</button>
@@ -3362,6 +3363,25 @@ async function handleDashboard(request, env) {
       function reauthorizeAccount(mode, id) {
         const params = new URLSearchParams({ mode, account_id: id });
         window.open("/api/auth/google/start?" + params.toString(), "_blank");
+      }
+
+      async function recheckAccount(id) {
+        try {
+          const res = await fetch("/api/user/account", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ action: "recheck", id })
+          });
+          const d = await res.json();
+          if (d.success) {
+            alert(d.message || "账号验证成功，已恢复正常！");
+            window.location.reload();
+          } else {
+            alert("验证恢复失败: " + (d.error || "未知错误"));
+          }
+        } catch (e) {
+          alert("请求失败: " + e.message);
+        }
       }
 
       async function toggleAccount(id, toEnable) {
@@ -4174,6 +4194,29 @@ async function handleAccountApi(request, env, ctx) {
       ctx.waitUntil(env.GEMINI_KV.delete(`quota:${username}:antigravity`));
       await saveUser(env, user, username);
       return jsonResponse({ success: true, message: "\u5DF2\u91CD\u7F6E\u51B7\u5374\u72B6\u6001" });
+    }
+
+    if (action === "recheck") {
+      if (!targetAccount) return jsonResponse({ error: "Account not found" }, 404);
+      if (!targetAccount.tokens?.refresh_token) {
+        return jsonResponse({ error: "\u8BE5\u8D26\u53F7\u6CA1\u6709 Refresh Token\uFF0C\u65E0\u6FA4\u81EA\u52A8\u5237\u65B0" }, 400);
+      }
+      const refreshed = await refreshAccountToken(targetAccount, targetAccount.mode, env);
+      if (refreshed.ok) {
+        targetAccount.status = "active";
+        targetAccount.error_message = null;
+        targetAccount.cooldown_until = 0;
+        clearAccountCooldown(username, id, ctx);
+        ctx.waitUntil(env.GEMINI_KV.delete(`quota:${username}:antigravity`));
+        ctx.waitUntil(env.GEMINI_KV.delete(`quota:${username}:${id}`));
+        await saveUser(env, user, username);
+        return jsonResponse({ success: true, message: "\u8D26\u53F7\u9A8C\u8BC1\u6210\u529F\uFF0C\u5DF2\u6062\u590D\u6B63\u5E38\u72B6\u6001\uFF01" });
+      } else {
+        if (refreshed.isAuthError) targetAccount.status = "error";
+        targetAccount.error_message = refreshed.error;
+        await saveUser(env, user, username);
+        return jsonResponse({ error: `\u9A8C\u8BC1\u5931\u8D25: ${refreshed.error}` }, 400);
+      }
     }
 
     return jsonResponse({ error: `Unknown action: ${action}` }, 400);
@@ -5671,6 +5714,7 @@ async function handleApiProxy(request, env, ctx, customPath, apiType) {
     sseStream = null;
     let accountSucceeded = false;
     let shouldFailoverToNext = false;
+    let tokenRefreshedOn401 = false;
     for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
     // Set when an Antigravity 429 looked transient (quota unknown or > 0) so the
     // outer loop — not a nested retry storm — spends the remaining attempts.
@@ -5746,6 +5790,30 @@ async function handleApiProxy(request, env, ctx, customPath, apiType) {
           300
         );
         console.warn(`[google-eligibility] account=${currentAccount.email || currentAccount.id} reason=${eligibilityReason} colo=${requestColo || "unknown"}`);
+      } else if (currentStatus === 401 && currentAccount.tokens?.refresh_token && !tokenRefreshedOn401) {
+        tokenRefreshedOn401 = true;
+        console.warn(`[401] Account '${currentAccount.email || currentAccount.id}' returned 401. Forcing token refresh...`);
+        const refreshed = await refreshAccountToken(currentAccount, mode, env);
+        if (refreshed.ok) {
+          console.warn(`[401] Token refreshed successfully for '${currentAccount.email || currentAccount.id}'. Retrying upstream request...`);
+          currentAccount.status = "active";
+          currentAccount.error_message = null;
+          requestHeaders["Authorization"] = `Bearer ${refreshed.tokens.access_token}`;
+          userStateDirty = true;
+          attempt--;
+          continue;
+        } else if (refreshed.isAuthError) {
+          console.error(`[401] Token refresh confirmed auth error for '${currentAccount.email || currentAccount.id}': ${refreshed.error}`);
+          currentAccount.status = "error";
+          currentAccount.error_message = refreshed.error;
+          userStateDirty = true;
+          if (hasNextAccount) {
+            shouldFailoverToNext = true;
+            break;
+          }
+        } else {
+          console.warn(`[401] Token refresh failed transiently for '${currentAccount.email || currentAccount.id}': ${refreshed.error}`);
+        }
       } else if (currentStatus === 401 || currentStatus === 403) {
         currentAccount.status = "error";
         currentAccount.error_message = `${currentStatus} ${currentStatus === 401 ? "Unauthorized" : "Forbidden"}`;
