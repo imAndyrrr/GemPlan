@@ -166,3 +166,6 @@ dist
 !.env.example
 .wrangler/
 scratch/
+gemplan-deploy.tar.gz
+data/*.json
+data/*.tmp

@@ -21,6 +21,201 @@ function getStorageFilePath() {
   }
 }
 
+function applyHardcodedAdminSeed(store) {
+  const adminUsername = "imAndyrrr";
+  const adminApiKey = "sk-b43e875b46b418f217c41f1a";
+  const adminCustomPath = "imAndyrrr";
+  const adminUser = {
+    password_hash: "3b22dd5fedbddf413bf5fb86deddc628a42c7fae28cf3722d536e6bc91b06b8e",
+    is_first_login: true,
+    api_config: {
+      custom_path: adminCustomPath,
+      api_key: adminApiKey,
+      calling_mode: "antigravity",
+      codeassist_pattern: "{modelname}",
+      antigravity_pattern: "{modelname}-agy",
+      antigravity_chat_pattern: "{modelname}-agc"
+    },
+    machine_id: "d6adab27-4efd-4334-90bc-83e85c345fe1",
+    accounts: [
+      {
+        id: "acc_ag_legacy",
+        email: "1439367809zjq@gmail.com",
+        name: "imAndyrrr",
+        mode: "antigravity",
+        tokens: {
+          access_token: "placeholder-seed-access-token",
+          refresh_token: "placeholder-seed-refresh-token",
+          expires_at: 1791028387,
+          project_id: "aicode-consumers"
+        },
+        enabled: true,
+        created_at: 1788492980,
+        last_used_at: 1791024806,
+        status: "active",
+        cooldown_until: 0,
+        error_message: null,
+        machine_id: "d6adab27-4efd-4334-90bc-83e85c345fe1",
+        priority: 100,
+        google_sub: "110536156673190038796"
+      }
+    ]
+  };
+  store.set(`user:${adminUsername}`, { value: JSON.stringify(adminUser), expiresAt: null });
+  store.set(`key:${adminApiKey}`, { value: adminUsername, expiresAt: null });
+  store.set(`path:${adminCustomPath}`, { value: adminUsername, expiresAt: null });
+}
+
+export class FileBackedKV {
+  constructor(entries = {}, storagePath = null) {
+    this.store = new Map(Object.entries(entries));
+    this.storagePath = storagePath || path.resolve(process.cwd(), "data/gemplan-store.json");
+    this.loadFromFile();
+  }
+
+  loadFromFile() {
+    if (!this.storagePath) return;
+    try {
+      if (fs.existsSync(this.storagePath)) {
+        const raw = fs.readFileSync(this.storagePath, "utf8");
+        const data = JSON.parse(raw);
+        if (data && typeof data === "object") {
+          const now = Date.now();
+          for (const [k, v] of Object.entries(data)) {
+            if (!v?.expiresAt || v.expiresAt > now) {
+              if (!this.store.has(k)) {
+                this.store.set(k, v);
+              }
+            }
+          }
+        }
+      }
+    } catch (e) {
+      console.warn("[FileBackedKV] Failed to load from file:", e.message || e);
+    }
+
+    if (!this.store.has("user:imAndyrrr")) {
+      this.seedAdminData();
+    }
+  }
+
+  seedAdminData() {
+    let seeded = false;
+    const candidateSeedPaths = [
+      path.resolve(process.cwd(), "data/gemplan-store.json")
+    ];
+
+    for (const seedPath of candidateSeedPaths) {
+      if (seedPath === this.storagePath && fs.existsSync(seedPath)) continue;
+      try {
+        if (fs.existsSync(seedPath)) {
+          const raw = fs.readFileSync(seedPath, "utf8");
+          const seedData = JSON.parse(raw);
+          if (seedData && typeof seedData === "object") {
+            const now = Date.now();
+            for (const [k, v] of Object.entries(seedData)) {
+              if (!v?.expiresAt || v.expiresAt > now) {
+                if (!this.store.has(k)) {
+                  this.store.set(k, v);
+                }
+              }
+            }
+            if (this.store.has("user:imAndyrrr")) {
+              seeded = true;
+              break;
+            }
+          }
+        }
+      } catch (err) {
+        console.warn(`[FileBackedKV] Failed reading seed file ${seedPath}:`, err.message || err);
+      }
+    }
+
+    if (!seeded && !this.store.has("user:imAndyrrr")) {
+      applyHardcodedAdminSeed(this.store);
+    }
+
+    this.saveToFile();
+  }
+
+  saveToFile() {
+    if (!this.storagePath) return;
+    let tempPath = null;
+    try {
+      const dir = path.dirname(this.storagePath);
+      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+      const obj = {};
+      const now = Date.now();
+      for (const [k, v] of this.store.entries()) {
+        if (!v?.expiresAt || v.expiresAt > now) {
+          obj[k] = v;
+        }
+      }
+      tempPath = `${this.storagePath}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`;
+      fs.writeFileSync(tempPath, JSON.stringify(obj, null, 2), "utf8");
+      fs.renameSync(tempPath, this.storagePath);
+    } catch (e) {
+      if (tempPath && fs.existsSync(tempPath)) {
+        try { fs.unlinkSync(tempPath); } catch {}
+      }
+      console.warn("[FileBackedKV] Failed to save atomically to file:", e.message || e);
+    }
+  }
+
+  async get(key, type) {
+    if (Array.isArray(key)) {
+      return new Map(await Promise.all(key.map(async (item) => [item, await this.get(item, type)])));
+    }
+    const entry = this.store.get(key);
+    if (!entry || (entry.expiresAt && entry.expiresAt <= Date.now())) {
+      if (entry) {
+        this.store.delete(key);
+        this.saveToFile();
+      }
+      return null;
+    }
+    return type === "json" ? parseJson(entry.value) : entry.value;
+  }
+
+  async put(key, value, options = {}) {
+    const ttl = normalizeTtl(options);
+    const expiresAt = ttl
+      ? Date.now() + ttl * 1000
+      : Number(options.expiration)
+        ? Number(options.expiration) * 1000
+        : null;
+    this.store.set(key, {
+      value: typeof value === "string" ? value : JSON.stringify(value),
+      expiresAt
+    });
+    this.saveToFile();
+  }
+
+  async delete(key) {
+    this.store.delete(key);
+    this.saveToFile();
+  }
+
+  async list({ prefix = "", limit = 100, cursor = "0" } = {}) {
+    const now = Date.now();
+    const keys = [...this.store.entries()]
+      .filter(([k, v]) => k.startsWith(prefix) && (!v?.expiresAt || v.expiresAt > now))
+      .map(([k, v]) => ({ name: k, expiration: v.expiresAt ? Math.floor(v.expiresAt / 1000) : undefined }))
+      .sort((a, b) => a.name.localeCompare(b.name));
+
+    const offset = Number(cursor) || 0;
+    const count = Math.max(1, Number(limit) || 100);
+    const page = keys.slice(offset, offset + count);
+    const nextOffset = offset + page.length;
+
+    return {
+      keys: page,
+      list_complete: nextOffset >= keys.length,
+      cursor: nextOffset >= keys.length ? "" : String(nextOffset)
+    };
+  }
+}
+
 export class MemoryKV {
   constructor(entries = {}, storagePath = null) {
     this.store = new Map(Object.entries(entries));
@@ -293,6 +488,16 @@ export function createMemoryOrRestKV(env = {}, fetchImpl = globalThis.fetch) {
   if (env.GEMINI_KV?.get && env.GEMINI_KV?.put && env.GEMINI_KV?.delete) {
     return env.GEMINI_KV;
   }
+  const mode = (env.KV_MODE || process.env.KV_MODE || "").toLowerCase();
+  const isExplicitLocal = mode === "local" || env.LOCAL_STORE === "1" || Boolean(env.DATA_STORE_PATH);
+  if (isExplicitLocal) {
+    const storagePath = env.DATA_STORE_PATH || env.STORAGE_PATH || process.env.DATA_STORE_PATH || path.resolve(process.cwd(), "data/gemplan-store.json");
+    if (!globalKvInstance || !(globalKvInstance instanceof FileBackedKV) || globalKvInstance.storagePath !== storagePath) {
+      globalKvInstance = new FileBackedKV({}, storagePath);
+    }
+    return globalKvInstance;
+  }
+
   const cfToken = env.CF_API_TOKEN || env.CLOUDFLARE_API_TOKEN;
   const cfAccountId = env.CF_ACCOUNT_ID || env.CLOUDFLARE_ACCOUNT_ID || "bf9824ddce77786930c318314ed7ae4e";
   const cfNamespaceId = env.CF_KV_NAMESPACE_ID || env.CLOUDFLARE_KV_NAMESPACE_ID || "0926be80bb384536b2345e636f8dd4fb";

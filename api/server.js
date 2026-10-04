@@ -2,6 +2,9 @@ import http from "node:http";
 import worker from "../src/worker.js";
 import { createRuntimeEnvironment, handleNodeRequest } from "./vercel-runtime.js";
 
+// Ensure standalone Node server defaults to purely local file-backed store (zero Cloudflare KV calls)
+process.env.KV_MODE = process.env.KV_MODE || "local";
+
 const port = Number(process.env.PORT || 8000);
 const host = process.env.HOST || "0.0.0.0";
 
@@ -24,7 +27,7 @@ server.keepAliveTimeout = 65000;
 server.headersTimeout = 66000;
 
 server.listen(port, host, () => {
-  console.log(`[gemplan] Server listening on http://${host}:${port}`);
+  console.log(`[gemplan] Server listening on http://${host}:${port} (KV mode: ${process.env.KV_MODE})`);
 });
 
 process.on("SIGTERM", () => {

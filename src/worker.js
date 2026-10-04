@@ -1613,21 +1613,41 @@ function shouldEnableThinking(body, resolvedModel, apiType) {
 }
 __name(shouldEnableThinking, "shouldEnableThinking");
 __name2(shouldEnableThinking, "shouldEnableThinking");
+function flattenTools(tools) {
+  if (!Array.isArray(tools)) return tools;
+  const result = [];
+  for (const tool of tools) {
+    if (!tool || typeof tool !== "object") continue;
+    if (tool.type === "namespace" && Array.isArray(tool.tools)) {
+      result.push(...flattenTools(tool.tools));
+    } else {
+      result.push(tool);
+    }
+  }
+  return result;
+}
+__name(flattenTools, "flattenTools");
+__name2(flattenTools, "flattenTools");
 function mapTools(body, apiType, needsUppercase = true, preserveDraft2020 = false) {
   if (!body.tools || !Array.isArray(body.tools)) {
     return void 0;
   }
+  const tools = flattenTools(body.tools);
   let functionDeclarations = [];
   if (apiType === "openai") {
-    for (const t of body.tools) {
-      if (t.type === "function" && t.function) {
+    for (const t of tools) {
+      const fn = t.function || (t.type === "function" && t.name ? t : null);
+      if (fn) {
+        const fnName = fn.name || t.name || "";
+        const fnParams = fn.parameters || t.parameters || {};
+        const fnDesc = fn.description || t.description || "";
         // CPU 优化：相同 tools schema 的清洗结果在 isolate 级缓存复用，
         // 跳过每次请求对大 schema 的全量递归清洗。缓存命中时 structuredClone
         // 出独立副本，与原来的原地清洗语义一致。
-        const cleanedParams = getCleanedSchema(apiType, t.function.name || "", t.function.parameters || {}, preserveDraft2020 ? false : needsUppercase);
+        const cleanedParams = getCleanedSchema(apiType, fnName, fnParams, preserveDraft2020 ? false : needsUppercase);
         const fd = {
-          name: t.function.name === "local_shell_call" ? "shell" : t.function.name,
-          description: t.function.description || "",
+          name: fnName === "local_shell_call" ? "shell" : fnName,
+          description: fnDesc,
           // body 由 request.json() 反序列化而来，是本请求独占的临时对象，
           // 直接原地修改无需 structuredClone（性能：大工具 schema 免去一次深拷贝）。
           parameters: cleanedParams
@@ -1636,13 +1656,16 @@ function mapTools(body, apiType, needsUppercase = true, preserveDraft2020 = fals
       }
     }
   } else if (apiType === "claude") {
-    for (const t of body.tools) {
+    for (const t of tools) {
       if (t.name === "google_search" || t.name === "builtin_web_search") continue;
-      if (t.name) {
-        const cleanedParams = getCleanedSchema(apiType, t.name, t.input_schema || {}, needsUppercase);
+      const fnName = t.name || t.function?.name;
+      if (fnName) {
+        const fnParams = t.input_schema || t.parameters || t.function?.parameters || {};
+        const fnDesc = t.description || t.function?.description || "";
+        const cleanedParams = getCleanedSchema(apiType, fnName, fnParams, needsUppercase);
         const fd = {
-          name: t.name === "local_shell_call" ? "shell" : t.name,
-          description: t.description || "",
+          name: fnName === "local_shell_call" ? "shell" : fnName,
+          description: fnDesc,
           parameters: cleanedParams
         };
         functionDeclarations.push(fd);
@@ -1825,15 +1848,22 @@ function responsesRequestToGeminiRequest(body) {
       appendParts("user", parts);
     }
   }
-  const normalizedTools = Array.isArray(body?.tools) ? body.tools.flatMap((tool) => {
-    if (!tool || tool.type !== "function") return [];
+  const flattenedTools = Array.isArray(body?.tools) ? flattenTools(body.tools) : void 0;
+  const normalizedTools = Array.isArray(flattenedTools) ? flattenedTools.flatMap((tool) => {
+    if (!tool) return [];
+    const fn = tool.function || (tool.type === "function" ? tool : (tool.name && tool.parameters ? tool : null));
+    if (!fn) return [];
+    const name = fn.name || tool.name || "unknown";
+    const description = fn.description || tool.description || "";
+    const parameters = fn.parameters || tool.parameters || {};
+    const strict = fn.strict !== void 0 ? fn.strict : tool.strict;
     return [{
       type: "function",
       function: {
-        name: tool.name || "unknown",
-        description: tool.description || "",
-        parameters: tool.parameters || {},
-        ...(tool.strict !== void 0 ? { strict: tool.strict } : {})
+        name,
+        description,
+        parameters,
+        ...(strict !== void 0 ? { strict } : {})
       }
     }];
   }) : void 0;
@@ -5088,6 +5118,9 @@ async function handleApiProxy(request, env, ctx, customPath, apiType) {
     body = await request.json();
   } catch (e) {
     return jsonResponse({ error: "Invalid JSON payload" }, 400);
+  }
+  if (Array.isArray(body?.tools)) {
+    body.tools = flattenTools(body.tools);
   }
   let responseFastPath = null;
   if (responseProtocol) {
