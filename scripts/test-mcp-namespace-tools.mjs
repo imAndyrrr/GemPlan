@@ -291,6 +291,84 @@ async function runTests() {
   assert.equal(props4.fixedFlag.type, "BOOLEAN");
   assert.equal(props4.fixedFlag.enum, undefined, "fixedFlag.enum should be stripped for BOOLEAN const");
   console.log("PASS: Non-string enums and boolean consts are cleanly sanitized for Google Gemini");
+
+  // 5. Test colliding tool names across multiple namespaces (e.g. mcp__cua_repl.js vs mcp__node_repl.js)
+  interceptedPayload = null;
+  const duplicateReq = new Request("https://example.test/mcp-test/v1/responses", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": "Bearer sk-mcp-test"
+    },
+    body: JSON.stringify({
+      model: "gemini-3.8-flash-high-agy",
+      input: [{ role: "user", content: [{ type: "input_text", text: "test duplicates" }] }],
+      tools: [
+        {
+          type: "namespace",
+          name: "mcp__cua_repl",
+          tools: [
+            { type: "function", name: "js", parameters: { type: "object" } },
+            { type: "function", name: "js_reset", parameters: { type: "object" } }
+          ]
+        },
+        {
+          type: "namespace",
+          name: "mcp__node_repl",
+          tools: [
+            { type: "function", name: "js", parameters: { type: "object" } },
+            { type: "function", name: "js_reset", parameters: { type: "object" } },
+            { type: "function", name: "unique_node_tool", parameters: { type: "object" } }
+          ]
+        }
+      ]
+    })
+  });
+
+  const res5 = await worker.fetch(duplicateReq, { GEMINI_KV: kv }, makeCtx());
+  assert.equal(res5.status, 200);
+  const decls5 = interceptedPayload?.request?.tools?.[0]?.functionDeclarations || [];
+  assert.equal(decls5.length, 5);
+  const names5 = decls5.map(d => d.name);
+  assert.ok(names5.includes("mcp__cua_repl__js"), "mcp__cua_repl__js should be disambiguated");
+  assert.ok(names5.includes("mcp__node_repl__js"), "mcp__node_repl__js should be disambiguated");
+  assert.ok(names5.includes("mcp__cua_repl__js_reset"), "mcp__cua_repl__js_reset should be disambiguated");
+  assert.ok(names5.includes("mcp__node_repl__js_reset"), "mcp__node_repl__js_reset should be disambiguated");
+  assert.ok(names5.includes("unique_node_tool"), "Non-colliding tool name should remain unchanged");
+  console.log("PASS: Colliding tool names across namespaces are automatically disambiguated with namespace prefixes");
+
+  // 6. Test response_format with array types (type: ["string", "null"])
+  interceptedPayload = null;
+  const schemaReq = new Request("https://example.test/mcp-test/v1/responses", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": "Bearer sk-mcp-test"
+    },
+    body: JSON.stringify({
+      model: "gemini-3.8-flash-high-agy",
+      input: [{ role: "user", content: [{ type: "input_text", text: "memory test" }] }],
+      text: {
+        format: {
+          type: "json_schema",
+          schema: {
+            type: "object",
+            properties: {
+              rollout_slug: { type: ["string", "null"] },
+              raw_memory: { type: "string" }
+            }
+          }
+        }
+      }
+    })
+  });
+
+  const res6 = await worker.fetch(schemaReq, { GEMINI_KV: kv }, makeCtx());
+  assert.equal(res6.status, 200);
+  const respSchema = interceptedPayload?.request?.generationConfig?.responseSchema;
+  assert.equal(respSchema.properties.rollout_slug.type, "string");
+  assert.equal(respSchema.properties.rollout_slug.nullable, true);
+  console.log("PASS: Response schema array type ['string', 'null'] is cleaned to string + nullable: true");
 }
 
 await runTests();

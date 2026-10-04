@@ -709,6 +709,13 @@ __name(mergeResolvedSchema, "mergeResolvedSchema");
 __name2(mergeResolvedSchema, "mergeResolvedSchema");
 function optimizeAndCleanSchema(schema, needsUppercase, defs = null, depth = 0, seenRefs = null) {
   if (!schema || typeof schema !== "object" || depth > 20) return;
+  if (Array.isArray(schema.type)) {
+    if (schema.type.includes("null")) {
+      schema.nullable = true;
+    }
+    const realType = schema.type.find((t) => t !== "null");
+    schema.type = realType || "string";
+  }
   if (defs === null) {
     defs = collectAllDefs(schema);
   }
@@ -1638,16 +1645,60 @@ __name(shouldEnableThinking, "shouldEnableThinking");
 __name2(shouldEnableThinking, "shouldEnableThinking");
 function flattenTools(tools) {
   if (!Array.isArray(tools)) return tools;
-  const result = [];
-  for (const tool of tools) {
-    if (!tool || typeof tool !== "object") continue;
-    if (tool.type === "namespace" && Array.isArray(tool.tools)) {
-      result.push(...flattenTools(tool.tools));
-    } else {
-      result.push(tool);
+  const nameCounts = new Map();
+  function countNames(list) {
+    for (const t of list) {
+      if (!t || typeof t !== "object") continue;
+      if (t.type === "namespace" && Array.isArray(t.tools)) {
+        countNames(t.tools);
+      } else {
+        const name = t.name || t.function?.name;
+        if (name) {
+          nameCounts.set(name, (nameCounts.get(name) || 0) + 1);
+        }
+      }
     }
   }
-  return result;
+  countNames(tools);
+
+  const result = [];
+  function flatten(list, namespace = null) {
+    for (const t of list) {
+      if (!t || typeof t !== "object") continue;
+      if (t.type === "namespace" && Array.isArray(t.tools)) {
+        flatten(t.tools, t.name || namespace);
+      } else {
+        const name = t.name || t.function?.name;
+        if (name && (nameCounts.get(name) || 0) > 1 && namespace) {
+          const cloned = structuredClone(t);
+          const newName = `${namespace}__${name}`;
+          if (cloned.function) {
+            cloned.function.name = newName;
+          } else {
+            cloned.name = newName;
+          }
+          result.push(cloned);
+        } else {
+          result.push(t);
+        }
+      }
+    }
+  }
+  flatten(tools);
+
+  const finalResult = [];
+  const seenNames = new Set();
+  for (const t of result) {
+    const name = t.name || t.function?.name;
+    if (name) {
+      if (seenNames.has(name)) {
+        continue;
+      }
+      seenNames.add(name);
+    }
+    finalResult.push(t);
+  }
+  return finalResult;
 }
 __name(flattenTools, "flattenTools");
 __name2(flattenTools, "flattenTools");
