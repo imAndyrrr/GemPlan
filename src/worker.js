@@ -793,8 +793,31 @@ function optimizeAndCleanSchema(schema, needsUppercase, defs = null, depth = 0, 
     }
   }
   if ("const" in schema) {
-    schema.enum = [schema.const];
+    if (typeof schema.const === "string") {
+      schema.enum = [schema.const];
+    } else if (typeof schema.const === "boolean" && !schema.type) {
+      schema.type = "boolean";
+    } else if (typeof schema.const === "number" && !schema.type) {
+      schema.type = "number";
+    }
     delete schema.const;
+  }
+  if (Array.isArray(schema.enum)) {
+    const hasOnlyStrings = schema.enum.every((v) => typeof v === "string");
+    const isExplicitNonString = schema.type && schema.type.toLowerCase() !== "string";
+    if (isExplicitNonString || (!hasOnlyStrings && !schema.type)) {
+      if (!schema.type && schema.enum.every((v) => typeof v === "boolean")) {
+        schema.type = "boolean";
+      } else if (!schema.type && schema.enum.every((v) => typeof v === "number")) {
+        schema.type = "number";
+      }
+      delete schema.enum;
+    } else {
+      schema.enum = schema.enum.filter((v) => v !== null && v !== void 0).map((v) => String(v));
+      if (schema.enum.length === 0) {
+        delete schema.enum;
+      }
+    }
   }
   if ("additionalProperties" in schema) {
     const ap = schema.additionalProperties;

@@ -234,6 +234,63 @@ async function runTests() {
   assert.equal(decls3.length, 1);
   assert.equal(decls3[0].name, "deep_tool");
   console.log("PASS: Multi-level nested namespaces are fully flattened");
+
+  // 4. Test tools with non-string enum (e.g. enum: [true] or const: true)
+  interceptedPayload = null;
+  const invalidEnumReq = new Request("https://example.test/mcp-test/v1/responses", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": "Bearer sk-mcp-test"
+    },
+    body: JSON.stringify({
+      model: "gemini-3.8-flash-high-agy",
+      input: [{ role: "user", content: [{ type: "input_text", text: "test" }] }],
+      tools: [
+        {
+          type: "function",
+          name: "create_worktree",
+          description: "Create worktree",
+          parameters: {
+            type: "object",
+            properties: {
+              allowAsync: {
+                type: "boolean",
+                description: "Allow async",
+                enum: [true]
+              },
+              mode: {
+                type: "string",
+                enum: ["fast", "slow"]
+              },
+              count: {
+                type: "integer",
+                enum: [1, 2, 3]
+              },
+              fixedFlag: {
+                const: true
+              }
+            }
+          }
+        }
+      ]
+    })
+  });
+
+  const res4 = await worker.fetch(invalidEnumReq, { GEMINI_KV: kv }, makeCtx());
+  assert.equal(res4.status, 200);
+  const decls4 = interceptedPayload?.request?.tools?.[0]?.functionDeclarations || [];
+  assert.equal(decls4.length, 1);
+  const props4 = decls4[0].parameters.properties;
+  assert.equal(props4.allowAsync.type, "BOOLEAN");
+  assert.equal(props4.allowAsync.enum, undefined, "allowAsync.enum should be stripped for BOOLEAN");
+  assert.equal(props4.mode.type, "STRING");
+  assert.deepEqual(props4.mode.enum, ["fast", "slow"], "mode.enum should be preserved for STRING");
+  assert.equal(props4.count.type, "INTEGER");
+  assert.equal(props4.count.enum, undefined, "count.enum should be stripped for INTEGER");
+  assert.equal(props4.fixedFlag.type, "BOOLEAN");
+  assert.equal(props4.fixedFlag.enum, undefined, "fixedFlag.enum should be stripped for BOOLEAN const");
+  console.log("PASS: Non-string enums and boolean consts are cleanly sanitized for Google Gemini");
 }
 
 await runTests();
