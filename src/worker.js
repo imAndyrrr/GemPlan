@@ -1643,8 +1643,14 @@ function shouldEnableThinking(body, resolvedModel, apiType) {
 }
 __name(shouldEnableThinking, "shouldEnableThinking");
 __name2(shouldEnableThinking, "shouldEnableThinking");
-function flattenTools(tools) {
-  if (!Array.isArray(tools)) return tools;
+function extractToolsAndNamespaceMaps(tools) {
+  if (!Array.isArray(tools)) {
+    return {
+      flattenedTools: tools,
+      toolToNamespaceMap: new Map(),
+      namespacedToGeminiNameMap: new Map()
+    };
+  }
   const nameCounts = new Map();
   function countNames(list) {
     for (const t of list) {
@@ -1661,34 +1667,56 @@ function flattenTools(tools) {
   }
   countNames(tools);
 
-  const result = [];
-  function flatten(list, namespace = null) {
+  const flattenedList = [];
+  const toolToNamespaceMap = new Map();
+  const namespacedToGeminiNameMap = new Map();
+
+  function flatten(list, currentNamespace = null) {
     for (const t of list) {
       if (!t || typeof t !== "object") continue;
       if (t.type === "namespace" && Array.isArray(t.tools)) {
-        flatten(t.tools, t.name || namespace);
+        flatten(t.tools, t.name || currentNamespace);
       } else {
-        const name = t.name || t.function?.name;
-        if (name && (nameCounts.get(name) || 0) > 1 && namespace) {
+        const origName = t.name || t.function?.name;
+        if (!origName) {
+          flattenedList.push(t);
+          continue;
+        }
+        let geminiName = origName;
+        if ((nameCounts.get(origName) || 0) > 1 && currentNamespace) {
+          geminiName = `${currentNamespace}__${origName}`;
           const cloned = structuredClone(t);
-          const newName = `${namespace}__${name}`;
           if (cloned.function) {
-            cloned.function.name = newName;
+            cloned.function.name = geminiName;
           } else {
-            cloned.name = newName;
+            cloned.name = geminiName;
           }
-          result.push(cloned);
+          flattenedList.push(cloned);
         } else {
-          result.push(t);
+          flattenedList.push(t);
+        }
+
+        const meta = {
+          originalName: origName,
+          namespace: currentNamespace || null,
+          geminiName
+        };
+        toolToNamespaceMap.set(geminiName, meta);
+        if (!toolToNamespaceMap.has(origName)) {
+          toolToNamespaceMap.set(origName, meta);
+        }
+        if (currentNamespace) {
+          namespacedToGeminiNameMap.set(`${currentNamespace}::${origName}`, geminiName);
+          namespacedToGeminiNameMap.set(`${currentNamespace}::${geminiName}`, geminiName);
         }
       }
     }
   }
   flatten(tools);
 
-  const finalResult = [];
+  const finalTools = [];
   const seenNames = new Set();
-  for (const t of result) {
+  for (const t of flattenedList) {
     const name = t.name || t.function?.name;
     if (name) {
       if (seenNames.has(name)) {
@@ -1696,9 +1724,18 @@ function flattenTools(tools) {
       }
       seenNames.add(name);
     }
-    finalResult.push(t);
+    finalTools.push(t);
   }
-  return finalResult;
+  return {
+    flattenedTools: finalTools,
+    toolToNamespaceMap,
+    namespacedToGeminiNameMap
+  };
+}
+__name(extractToolsAndNamespaceMaps, "extractToolsAndNamespaceMaps");
+__name2(extractToolsAndNamespaceMaps, "extractToolsAndNamespaceMaps");
+function flattenTools(tools) {
+  return extractToolsAndNamespaceMaps(tools).flattenedTools;
 }
 __name(flattenTools, "flattenTools");
 __name2(flattenTools, "flattenTools");
@@ -1787,7 +1824,7 @@ function responseOutputToGeminiText(output) {
 }
 __name(responseOutputToGeminiText, "responseOutputToGeminiText");
 __name2(responseOutputToGeminiText, "responseOutputToGeminiText");
-function responsesRequestToGeminiRequest(body) {
+function responsesRequestToGeminiRequest(body, namespacedToGeminiNameMap = null) {
   const contents = [];
   const functionNames = new Map();
   const pendingFunctionResponses = new Map();
@@ -1854,7 +1891,11 @@ function responsesRequestToGeminiRequest(body) {
       }
       const toolIdentity = decodeToolCallIdentity(item.call_id || item.id || "");
       const rawId = item.call_id || item.id || "";
-      const functionName = item.name || "unknown";
+      let functionName = item.name || "unknown";
+      if (item.namespace && namespacedToGeminiNameMap) {
+        const mapped = namespacedToGeminiNameMap.get(`${item.namespace}::${functionName}`);
+        if (mapped) functionName = mapped;
+      }
       if (!toolIdentity.thoughtSignature) allToolCallsHaveRealSignatures = false;
       if (!toolIdentity.id || seenToolCallIds.has(toolIdentity.id)) {
         toolCallIdsUnique = false;
@@ -1891,8 +1932,16 @@ function responsesRequestToGeminiRequest(body) {
       const extracted = extractToolResultMediaAndText(item.output);
       const { mediaParts } = extracted;
       const resultText = extracted.resultText ?? ((extracted.textParts.length === 1 ? extracted.textParts[0] : extracted.textParts.join("\n")) || (mediaParts.length > 0 ? "Image content attached" : responseOutputToGeminiText(item.output)));
+      let respName = functionNames.get(id);
+      if (!respName && item.name) {
+        respName = item.name;
+        if (item.namespace && namespacedToGeminiNameMap) {
+          const mapped = namespacedToGeminiNameMap.get(`${item.namespace}::${respName}`);
+          if (mapped) respName = mapped;
+        }
+      }
       const funcResp = {
-        name: functionNames.get(id) || "unknown",
+        name: respName || "unknown",
         response: { result: resultText },
         id
       };
@@ -2016,7 +2065,7 @@ function responsesStatusFromFinishReason(finishReason) {
 }
 __name(responsesStatusFromFinishReason, "responsesStatusFromFinishReason");
 __name2(responsesStatusFromFinishReason, "responsesStatusFromFinishReason");
-function googleResponseToResponses(data, inputModel, mode) {
+function googleResponseToResponses(data, inputModel, mode, toolToNamespaceMap = null) {
   const raw = data?.response || data || {};
   const output = [];
   const statusInfo = responsesStatusFromFinishReason(raw.candidates?.[0]?.finishReason);
@@ -2035,14 +2084,21 @@ function googleResponseToResponses(data, inputModel, mode) {
         const fc = part.functionCall;
         const rawId = fc.id || `call_${fc.name || "function"}_${generateRandomString(8)}`;
         const callId = encodeToolCallIdentity(rawId, part.thoughtSignature || part.thought_signature);
-        functionCalls.push({
+        const meta = toolToNamespaceMap?.get ? toolToNamespaceMap.get(fc.name) : toolToNamespaceMap?.[fc.name];
+        const namespace = typeof meta === "string" ? meta : meta?.namespace;
+        const callName = (typeof meta === "object" && meta?.originalName) ? meta.originalName : (fc.name || "unknown");
+        const fcItem = {
           type: "function_call",
           id: `fc_${generateRandomString(16)}`,
           call_id: callId,
-          name: fc.name || "unknown",
+          name: callName,
           arguments: typeof fc.args === "string" ? fc.args : JSON.stringify(fc.args || {}),
           status: "completed"
-        });
+        };
+        if (namespace) {
+          fcItem.namespace = namespace;
+        }
+        functionCalls.push(fcItem);
       }
     }
     if (reasoningParts.length > 0) {
@@ -2284,7 +2340,7 @@ async function writeResponsesEvent(writer, encoder, type, payload, sequenceNumbe
 }
 __name(writeResponsesEvent, "writeResponsesEvent");
 __name2(writeResponsesEvent, "writeResponsesEvent");
-async function processResponsesStreamLines(lines, writableStream, inputModel, mode, env, sessionId, messageCount, ctx) {
+async function processResponsesStreamLines(lines, writableStream, inputModel, mode, env, sessionId, messageCount, ctx, toolToNamespaceMap = null) {
   const writer = writableStream.getWriter();
   const encoder = new TextEncoder();
   let sequenceNumber = 1;
@@ -2416,15 +2472,21 @@ async function processResponsesStreamLines(lines, writableStream, inputModel, mo
           const callId = encodeToolCallIdentity(rawId, part.thoughtSignature || part.thought_signature);
           let state = functionCallStates.get(callId);
           if (!state) {
+            const meta = toolToNamespaceMap?.get ? toolToNamespaceMap.get(fc.name) : toolToNamespaceMap?.[fc.name];
+            const namespace = typeof meta === "string" ? meta : meta?.namespace;
+            const callName = (typeof meta === "object" && meta?.originalName) ? meta.originalName : (fc.name || "unknown");
             state = {
               type: "function_call",
               id: `fc_${generateRandomString(16)}`,
               call_id: callId,
-              name: fc.name || "unknown",
+              name: callName,
               arguments: "",
               status: "in_progress",
               output_index: output.length
             };
+            if (namespace) {
+              state.namespace = namespace;
+            }
             functionCallStates.set(callId, state);
             output.push(state);
             await emit("response.output_item.added", {
@@ -2532,8 +2594,8 @@ async function processResponsesStreamLines(lines, writableStream, inputModel, mo
 }
 __name(processResponsesStreamLines, "processResponsesStreamLines");
 __name2(processResponsesStreamLines, "processResponsesStreamLines");
-async function streamResponsesSimulatedResponse(data, writableStream, inputModel, mode, env, sessionId, messageCount, ctx) {
-  return processResponsesStreamLines([`data: ${JSON.stringify(data)}`], writableStream, inputModel, mode, env, sessionId, messageCount, ctx);
+async function streamResponsesSimulatedResponse(data, writableStream, inputModel, mode, env, sessionId, messageCount, ctx, toolToNamespaceMap = null) {
+  return processResponsesStreamLines([`data: ${JSON.stringify(data)}`], writableStream, inputModel, mode, env, sessionId, messageCount, ctx, toolToNamespaceMap);
 }
 __name(streamResponsesSimulatedResponse, "streamResponsesSimulatedResponse");
 __name2(streamResponsesSimulatedResponse, "streamResponsesSimulatedResponse");
@@ -5193,14 +5255,19 @@ async function handleApiProxy(request, env, ctx, customPath, apiType) {
   } catch (e) {
     return jsonResponse({ error: "Invalid JSON payload" }, 400);
   }
+  let toolMetaMap = null;
+  let namespacedToGeminiNameMap = null;
   if (Array.isArray(body?.tools)) {
-    body.tools = flattenTools(body.tools);
+    const extracted = extractToolsAndNamespaceMaps(body.tools);
+    body.tools = extracted.flattenedTools;
+    toolMetaMap = extracted.toolToNamespaceMap;
+    namespacedToGeminiNameMap = extracted.namespacedToGeminiNameMap;
   }
   let responseFastPath = null;
   if (responseProtocol) {
     // Avoid materializing an intermediate Chat-shaped copy of a large
     // Responses history. The fast path below builds Gemini contents directly.
-    responseFastPath = responsesRequestToGeminiRequest(body || {});
+    responseFastPath = responsesRequestToGeminiRequest(body || {}, namespacedToGeminiNameMap);
     apiType = "openai";
   }
   const geminiRoute = apiType === "gemini" ? getGeminiRouteInfo(request) : null;
@@ -6102,9 +6169,9 @@ async function handleApiProxy(request, env, ctx, customPath, apiType) {
       (async () => {
         try {
           if (!useStreamUpstream) {
-            await streamResponsesSimulatedResponse(responseData, writable, inputModel, mode, env, sessionId, messageCount, ctx);
+            await streamResponsesSimulatedResponse(responseData, writable, inputModel, mode, env, sessionId, messageCount, ctx, toolMetaMap);
           } else {
-            await processResponsesSseStream(sseStream, writable, inputModel, mode);
+            await processResponsesSseStream(sseStream, writable, inputModel, mode, toolMetaMap);
           }
         } catch (e) {
           try {
@@ -6173,7 +6240,7 @@ async function handleApiProxy(request, env, ctx, customPath, apiType) {
       }
     }
     if (responseProtocol) {
-      return jsonResponse(googleResponseToResponses(data, inputModel, mode));
+      return jsonResponse(googleResponseToResponses(data, inputModel, mode, toolMetaMap));
     }
     if (apiType === "openai") {
       const raw = data.response || data;

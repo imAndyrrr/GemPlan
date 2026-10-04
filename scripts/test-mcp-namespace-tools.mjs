@@ -369,6 +369,210 @@ async function runTests() {
   assert.equal(respSchema.properties.rollout_slug.type, "string");
   assert.equal(respSchema.properties.rollout_slug.nullable, true);
   console.log("PASS: Response schema array type ['string', 'null'] is cleaned to string + nullable: true");
+
+  // 7. Test Responses endpoint returning function_call with correct namespace in JSON
+  globalThis.fetch = async (url, options = {}) => {
+    return new Response(JSON.stringify({
+      response: {
+        candidates: [{
+          content: {
+            role: "model",
+            parts: [{
+              functionCall: {
+                name: "search_web",
+                args: { query: "Termux" }
+              }
+            }]
+          },
+          finishReason: "STOP"
+        }],
+        usageMetadata: { promptTokenCount: 15, candidatesTokenCount: 8, totalTokenCount: 23 }
+      }
+    }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" }
+    });
+  };
+
+  const fcReq = new Request("https://example.test/mcp-test/v1/responses", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": "Bearer sk-mcp-test"
+    },
+    body: JSON.stringify({
+      model: "gemini-3.8-flash-high-agy",
+      input: [{ role: "user", content: [{ type: "input_text", text: "search Termux" }] }],
+      tools: [
+        {
+          type: "function",
+          name: "exec_command",
+          parameters: { type: "object" }
+        },
+        {
+          type: "namespace",
+          name: "mcp__web_search",
+          tools: [
+            {
+              type: "function",
+              name: "search_web",
+              parameters: { type: "object", properties: { query: { type: "string" } } }
+            }
+          ]
+        }
+      ]
+    })
+  });
+
+  const res7 = await worker.fetch(fcReq, { GEMINI_KV: kv }, makeCtx());
+  assert.equal(res7.status, 200);
+  const data7 = await res7.json();
+  const toolCall7 = data7.output?.find(item => item.type === "function_call");
+  assert.ok(toolCall7, "Should have function_call in output");
+  assert.equal(toolCall7.name, "search_web");
+  assert.equal(toolCall7.namespace, "mcp__web_search", "function_call must have namespace 'mcp__web_search'");
+  console.log("PASS: Non-streaming Responses function_call correctly populated with namespace");
+
+  // 8. Test Responses SSE stream returning function_call with correct namespace
+  globalThis.fetch = async (url, options = {}) => {
+    const sseBody = [
+      `data: ${JSON.stringify({
+        response: {
+          candidates: [{
+            content: {
+              role: "model",
+              parts: [{
+                functionCall: {
+                  name: "search_web",
+                  args: { query: "Termux stream" }
+                }
+              }]
+            },
+            finishReason: "STOP"
+          }],
+          usageMetadata: { promptTokenCount: 15, candidatesTokenCount: 8, totalTokenCount: 23 }
+        }
+      })}\n\n`,
+      "data: [DONE]\n\n"
+    ].join("");
+
+    return new Response(sseBody, {
+      status: 200,
+      headers: { "Content-Type": "text/event-stream" }
+    });
+  };
+
+  const sseReq = new Request("https://example.test/mcp-test/v1/responses", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": "Bearer sk-mcp-test"
+    },
+    body: JSON.stringify({
+      model: "gemini-3.8-flash-high-agy",
+      stream: true,
+      input: [{ role: "user", content: [{ type: "input_text", text: "search Termux" }] }],
+      tools: [
+        {
+          type: "namespace",
+          name: "mcp__web_search",
+          tools: [
+            {
+              type: "function",
+              name: "search_web",
+              parameters: { type: "object", properties: { query: { type: "string" } } }
+            }
+          ]
+        }
+      ]
+    })
+  });
+
+  const res8 = await worker.fetch(sseReq, { GEMINI_KV: kv }, makeCtx());
+  assert.equal(res8.status, 200);
+  const sseText = await res8.text();
+  assert.ok(sseText.includes('"namespace":"mcp__web_search"'), "SSE event must contain namespace 'mcp__web_search'");
+  console.log("PASS: Streaming Responses SSE function_call correctly populated with namespace");
+
+  // 9. Test disambiguated tool restored to original name + namespace on output,
+  //    and multi-turn input history with namespace mapped back to upstream disambiguated name
+  interceptedPayload = null;
+  globalThis.fetch = async (url, options = {}) => {
+    if (typeof options.body === "string") {
+      try {
+        interceptedPayload = JSON.parse(options.body);
+      } catch (_) {}
+    }
+    return new Response(JSON.stringify({
+      response: {
+        candidates: [{
+          content: {
+            role: "model",
+            parts: [{
+              functionCall: {
+                name: "mcp__cua_repl__js",
+                args: { code: "console.log(1)" }
+              }
+            }]
+          },
+          finishReason: "STOP"
+        }]
+      }
+    }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" }
+    });
+  };
+
+  const disambigReq = new Request("https://example.test/mcp-test/v1/responses", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": "Bearer sk-mcp-test"
+    },
+    body: JSON.stringify({
+      model: "gemini-3.8-flash-high-agy",
+      input: [
+        {
+          type: "function_call",
+          call_id: "call_history_1",
+          name: "js",
+          namespace: "mcp__cua_repl",
+          arguments: "{\"code\":\"init()\"}"
+        },
+        {
+          type: "function_call_output",
+          call_id: "call_history_1",
+          output: "ok"
+        }
+      ],
+      tools: [
+        {
+          type: "namespace",
+          name: "mcp__cua_repl",
+          tools: [{ type: "function", name: "js", parameters: { type: "object" } }]
+        },
+        {
+          type: "namespace",
+          name: "mcp__node_repl",
+          tools: [{ type: "function", name: "js", parameters: { type: "object" } }]
+        }
+      ]
+    })
+  });
+
+  const res9 = await worker.fetch(disambigReq, { GEMINI_KV: kv }, makeCtx());
+  assert.equal(res9.status, 200);
+  const data9 = await res9.json();
+  const toolCall9 = data9.output?.find(item => item.type === "function_call");
+  assert.equal(toolCall9.name, "js", "Output name must be original name 'js'");
+  assert.equal(toolCall9.namespace, "mcp__cua_repl", "Output namespace must be 'mcp__cua_repl'");
+
+  // Verify input history sent upstream mapped back to mcp__cua_repl__js
+  const upstreamContents = interceptedPayload?.request?.contents || [];
+  const historyFc = upstreamContents.find(c => c.role === "model")?.parts?.find(p => p.functionCall);
+  assert.equal(historyFc.functionCall.name, "mcp__cua_repl__js", "History function_call name sent upstream must be disambiguated name");
+  console.log("PASS: Disambiguated tools restored on output and mapped correctly from input history");
 }
 
 await runTests();

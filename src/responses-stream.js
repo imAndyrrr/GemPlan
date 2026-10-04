@@ -74,7 +74,7 @@ async function writeResponsesEvent(writer, encoder, type, payload, sequenceNumbe
   await writer.write(encoder.encode(`event: ${type}\ndata: ${JSON.stringify(event)}\n\n`));
 }
 
-export function createResponsesStreamProcessor(writableStream, inputModel, mode) {
+export function createResponsesStreamProcessor(writableStream, inputModel, mode, toolToNamespaceMap = null) {
   const writer = writableStream.getWriter();
   const encoder = new TextEncoder();
   let sequenceNumber = 1;
@@ -211,14 +211,20 @@ export function createResponsesStreamProcessor(writableStream, inputModel, mode)
         const thoughtSignature = part.thoughtSignature || part.thought_signature;
         let state = functionCallStates.get(rawId);
         if (!state) {
+          const meta = toolToNamespaceMap?.get ? toolToNamespaceMap.get(fc.name) : toolToNamespaceMap?.[fc.name];
+          const namespace = typeof meta === "string" ? meta : meta?.namespace;
+          const callName = (typeof meta === "object" && meta?.originalName) ? meta.originalName : (fc.name || "unknown");
           const item = {
             type: "function_call",
             id: `fc_${generateRandomString(16)}`,
             call_id: encodeToolCallIdentity(rawId, thoughtSignature),
-            name: fc.name || "unknown",
+            name: callName,
             arguments: "",
             status: "in_progress"
           };
+          if (namespace) {
+            item.namespace = namespace;
+          }
           state = { rawId, outputIndex: output.length, item };
           functionCallStates.set(rawId, state);
           output.push(item);
@@ -336,8 +342,8 @@ export function createResponsesStreamProcessor(writableStream, inputModel, mode)
   return { processData, processLine, finish, close };
 }
 
-export async function processResponsesSseStream(readableStream, writableStream, inputModel, mode) {
-  const processor = createResponsesStreamProcessor(writableStream, inputModel, mode);
+export async function processResponsesSseStream(readableStream, writableStream, inputModel, mode, toolToNamespaceMap = null) {
+  const processor = createResponsesStreamProcessor(writableStream, inputModel, mode, toolToNamespaceMap);
   const reader = readableStream.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
