@@ -154,9 +154,9 @@ async function runTests() {
   assert.equal(decls1.length, 3, `Expected 3 functionDeclarations but got ${decls1.length}`);
   const names1 = decls1.map((d) => d.name);
   assert.ok(names1.includes("exec_command"), "Missing exec_command");
-  assert.ok(names1.includes("search_web"), "Missing search_web from namespace");
-  assert.ok(names1.includes("fetch_url"), "Missing fetch_url from namespace");
-  console.log("PASS: Responses endpoint unpacks and normalizes type: 'namespace' MCP tools");
+  assert.ok(names1.includes("mcp__web_search__search_web"), "Missing mcp__web_search__search_web from namespace");
+  assert.ok(names1.includes("mcp__web_search__fetch_url"), "Missing mcp__web_search__fetch_url from namespace");
+  console.log("PASS: Responses endpoint unpacks and normalizes type: 'namespace' MCP tools with global prefixing");
 
   // 2. Test /v1/chat/completions endpoint with nested namespace tools
   interceptedPayload = null;
@@ -192,8 +192,8 @@ async function runTests() {
   assert.equal(res2.status, 200, `Expected 200 but got ${res2.status}`);
   const decls2 = interceptedPayload?.request?.tools?.[0]?.functionDeclarations || [];
   assert.equal(decls2.length, 1);
-  assert.equal(decls2[0].name, "click_mouse");
-  console.log("PASS: Chat completions unpacks and normalizes type: 'namespace' MCP tools");
+  assert.equal(decls2[0].name, "mcp__windows__click_mouse");
+  console.log("PASS: Chat completions unpacks and normalizes type: 'namespace' MCP tools with prefixing");
 
   // 3. Test deeply nested namespaces
   interceptedPayload = null;
@@ -232,8 +232,8 @@ async function runTests() {
   assert.equal(res3.status, 200);
   const decls3 = interceptedPayload?.request?.tools?.[0]?.functionDeclarations || [];
   assert.equal(decls3.length, 1);
-  assert.equal(decls3[0].name, "deep_tool");
-  console.log("PASS: Multi-level nested namespaces are fully flattened");
+  assert.equal(decls3[0].name, "inner__deep_tool");
+  console.log("PASS: Multi-level nested namespaces are fully flattened and prefixed");
 
   // 4. Test tools with non-string enum (e.g. enum: [true] or const: true)
   interceptedPayload = null;
@@ -334,8 +334,8 @@ async function runTests() {
   assert.ok(names5.includes("mcp__node_repl__js"), "mcp__node_repl__js should be disambiguated");
   assert.ok(names5.includes("mcp__cua_repl__js_reset"), "mcp__cua_repl__js_reset should be disambiguated");
   assert.ok(names5.includes("mcp__node_repl__js_reset"), "mcp__node_repl__js_reset should be disambiguated");
-  assert.ok(names5.includes("unique_node_tool"), "Non-colliding tool name should remain unchanged");
-  console.log("PASS: Colliding tool names across namespaces are automatically disambiguated with namespace prefixes");
+  assert.ok(names5.includes("mcp__node_repl__unique_node_tool"), "All tools under namespaces receive global prefixing");
+  console.log("PASS: All tools under namespaces receive global prefixing (Antigravity style)");
 
   // 6. Test response_format with array types (type: ["string", "null"])
   interceptedPayload = null;
@@ -379,7 +379,7 @@ async function runTests() {
             role: "model",
             parts: [{
               functionCall: {
-                name: "search_web",
+                name: "mcp__web_search__search_web",
                 args: { query: "Termux" }
               }
             }]
@@ -443,7 +443,7 @@ async function runTests() {
               role: "model",
               parts: [{
                 functionCall: {
-                  name: "search_web",
+                  name: "mcp__web_search__search_web",
                   args: { query: "Termux stream" }
                 }
               }]

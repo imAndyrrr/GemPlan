@@ -1683,8 +1683,10 @@ function extractToolsAndNamespaceMaps(tools) {
           continue;
         }
         let geminiName = origName;
-        if ((nameCounts.get(origName) || 0) > 1 && currentNamespace) {
-          geminiName = `${currentNamespace}__${origName}`;
+        if (currentNamespace) {
+          geminiName = origName.startsWith(`${currentNamespace}__`)
+            ? origName
+            : `${currentNamespace}__${origName}`;
           const cloned = structuredClone(t);
           if (cloned.function) {
             cloned.function.name = geminiName;
@@ -1895,6 +1897,8 @@ function responsesRequestToGeminiRequest(body, namespacedToGeminiNameMap = null)
       if (item.namespace && namespacedToGeminiNameMap) {
         const mapped = namespacedToGeminiNameMap.get(`${item.namespace}::${functionName}`);
         if (mapped) functionName = mapped;
+      } else if (item.namespace && !functionName.startsWith(`${item.namespace}__`)) {
+        functionName = `${item.namespace}__${functionName}`;
       }
       if (!toolIdentity.thoughtSignature) allToolCallsHaveRealSignatures = false;
       if (!toolIdentity.id || seenToolCallIds.has(toolIdentity.id)) {
@@ -1938,6 +1942,8 @@ function responsesRequestToGeminiRequest(body, namespacedToGeminiNameMap = null)
         if (item.namespace && namespacedToGeminiNameMap) {
           const mapped = namespacedToGeminiNameMap.get(`${item.namespace}::${respName}`);
           if (mapped) respName = mapped;
+        } else if (item.namespace && !respName.startsWith(`${item.namespace}__`)) {
+          respName = `${item.namespace}__${respName}`;
         }
       }
       const funcResp = {
