@@ -10,6 +10,12 @@ const host = process.env.HOST || "0.0.0.0";
 
 const env = createRuntimeEnvironment();
 
+if (typeof globalThis.gc === "function") {
+  setInterval(() => {
+    try { globalThis.gc(); } catch (_) {}
+  }, 60000).unref();
+}
+
 const server = http.createServer(async (req, res) => {
   try {
     await handleNodeRequest(worker, req, res, env);

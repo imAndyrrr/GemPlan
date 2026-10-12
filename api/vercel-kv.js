@@ -217,8 +217,9 @@ export class FileBackedKV {
 }
 
 export class MemoryKV {
-  constructor(entries = {}, storagePath = null) {
+  constructor(entries = {}, storagePath = null, maxEntries = 2048) {
     this.store = new Map(Object.entries(entries));
+    this.maxEntries = maxEntries;
     this.storagePath = storagePath;
     if (this.storagePath) {
       this.loadFromFile();
@@ -291,6 +292,10 @@ export class MemoryKV {
       value: typeof value === "string" ? value : JSON.stringify(value),
       expiresAt
     });
+    if (this.store.size > this.maxEntries) {
+      const oldestKey = this.store.keys().next().value;
+      if (oldestKey !== void 0) this.store.delete(oldestKey);
+    }
     this.saveToFile();
   }
 
