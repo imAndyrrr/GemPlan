@@ -3155,9 +3155,76 @@ async function handleLogin(request, env) {
 }
 __name(handleLogin, "handleLogin");
 __name2(handleLogin, "handleLogin");
+function isVpsEnvironment(env) {
+  if (env?.auditLogStore) return true;
+  if (env?.IS_VPS === "true" || env?.IS_VPS === true || env?.IS_VPS === "1") return true;
+  if (env?.KV_MODE === "local") return true;
+  if (typeof process !== "undefined" && (process.env?.IS_VPS === "true" || process.env?.KV_MODE === "local")) return true;
+  return false;
+}
+__name(isVpsEnvironment, "isVpsEnvironment");
+__name2(isVpsEnvironment, "isVpsEnvironment");
+async function handleGetRecentLogs(request, env) {
+  const username = await getSessionUser(request, env);
+  if (!username) return jsonResponse({ error: "Unauthorized" }, 401);
+  if (!env?.auditLogStore && !isVpsEnvironment(env)) {
+    return jsonResponse({ error: "Audit logging is only enabled in VPS mode", logs: [] }, 403);
+  }
+  const url = new URL(request.url);
+  const nRaw = url.searchParams.get("n");
+  let n = Number.parseInt(nRaw, 10);
+  if (!Number.isFinite(n) || n <= 0) n = 10;
+  if (n > 200) n = 200;
+  const logs = env?.auditLogStore ? await env.auditLogStore.getLogs(n, username) : [];
+  return jsonResponse({
+    success: true,
+    n,
+    total: logs.length,
+    logs
+  });
+}
+__name(handleGetRecentLogs, "handleGetRecentLogs");
+__name2(handleGetRecentLogs, "handleGetRecentLogs");
+async function handleClearAuditLogs(request, env) {
+  const username = await getSessionUser(request, env);
+  if (!username) return jsonResponse({ error: "Unauthorized" }, 401);
+  if (!env?.auditLogStore && !isVpsEnvironment(env)) {
+    return jsonResponse({ error: "Audit logging is only enabled in VPS mode" }, 403);
+  }
+  if (env?.auditLogStore) {
+    await env.auditLogStore.clearLogs(username);
+  }
+  return jsonResponse({ success: true, message: "Logs cleared successfully" });
+}
+__name(handleClearAuditLogs, "handleClearAuditLogs");
+__name2(handleClearAuditLogs, "handleClearAuditLogs");
+async function handleGetTokenStats(request, env) {
+  const username = await getSessionUser(request, env);
+  if (!username) return jsonResponse({ error: "Unauthorized" }, 401);
+  if (!env?.tokenStatsStore && !env?.auditLogStore?.tokenStatsStore && !isVpsEnvironment(env)) {
+    return jsonResponse({ error: "Token stats is only enabled in VPS mode", daily: [], summary: {} }, 403);
+  }
+  const url = new URL(request.url);
+  const daysRaw = url.searchParams.get("days");
+  const startDate = url.searchParams.get("start");
+  const endDate = url.searchParams.get("end");
+  let days = Number.parseInt(daysRaw, 10);
+  if (!Number.isFinite(days) || days <= 0) days = 7;
+  if (days > 365) days = 365;
+
+  const store = env?.tokenStatsStore || env?.auditLogStore?.tokenStatsStore;
+  const stats = store ? store.getStats({ days, startDate, endDate, username }) : { daily: [], summary: {} };
+  return jsonResponse({
+    success: true,
+    ...stats
+  });
+}
+__name(handleGetTokenStats, "handleGetTokenStats");
+__name2(handleGetTokenStats, "handleGetTokenStats");
 async function handleDashboard(request, env) {
   const username = await getSessionUser(request, env);
   if (!username) return Response.redirect(`${new URL(request.url).origin}/login`, 302);
+  const isVps = Boolean(env?.auditLogStore || isVpsEnvironment(env));
   const user = await env.GEMINI_KV.get(`user:${username}`, "json");
   const accounts = getUserAccounts(user);
   const transientCooldownByAccountId = await getAccountCooldowns(accounts, username);
@@ -3340,6 +3407,97 @@ async function handleDashboard(request, env) {
         </div>
       </div>
     </div>
+
+    ${isVps ? `
+    <div class="card" id="audit-logs-card">
+      <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;">
+        <h3 style="margin:0; color:#17a2b8;">\u7B2C\u4E94\u90E8\u5206\uFF1A\u8BF7\u6C42\u4E0E\u54CD\u5E94\u5BA1\u8BA1\u65E5\u5FD7 (VPS)</h3>
+        <span style="font-size:11px; background:#17a2b8; color:#fff; padding:2px 8px; border-radius:10px; font-weight:bold;">VPS \u672C\u5730\u6301\u4E45\u5316</span>
+      </div>
+      <p style="font-size:12px; color:#666; margin:8px 0 14px;">
+        \u67E5\u770B\u7ECF\u7531\u672C\u7F51\u5173\u5904\u7406\u7684\u5B8C\u6574\u8BF7\u6C42\u4F53\u4E0E\u54CD\u5E94\u4F53\uFF08\u652F\u6301\u6D41\u5F0F SSE \u5B8C\u6574\u805A\u5408\uFF09\u3002n \u53EF\u7531\u60A8\u81EA\u5B9A\u4E49\u8BBE\u7F6E\u3002
+      </p>
+      
+      <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-bottom:12px; background:#f8f9fa; padding:12px; border-radius:6px; border:1px solid #e9ecef;">
+        <label style="font-size:13px; font-weight:bold; color:#495057; display:flex; align-items:center; gap:6px; margin:0;">
+          \u83B7\u53D6\u6761\u6570 (n):
+          <input type="number" id="audit-log-n" value="10" min="1" max="200" style="width:70px; padding:6px 8px; margin:0; border:1px solid #ced4da; border-radius:4px; font-size:13px; text-align:center;">
+        </label>
+        <button id="view-audit-logs-btn" onclick="fetchRecentAuditLogs()" style="flex:1; min-width:180px; margin:0; background:#17a2b8; padding:8px 16px; border-radius:4px; font-weight:bold; font-size:13px; color:#fff; cursor:pointer;">
+          \uD83D\uDCCB \u67E5\u770B\u6700\u8FD1\u8BF7\u6C42\u4E0E\u54CD\u5E94
+        </button>
+        <button onclick="clearAuditLogs()" style="width:auto; margin:0; background:#6c757d; padding:8px 12px; border-radius:4px; font-size:12px; color:#fff; cursor:pointer;">
+          \u6E05\u7A7A\u8BB0\u5F55
+        </button>
+      </div>
+      
+      <div id="audit-logs-status" style="font-size:13px; color:#666; margin-bottom:8px;"></div>
+      <div id="audit-logs-container" style="display:none; max-height:650px; overflow-y:auto; border:1px solid #dee2e6; border-radius:6px; padding:10px; background:#ffffff;"></div>
+    </div>` : ''}
+
+    ${isVps ? `
+    <div class="card" id="token-stats-card">
+      <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;">
+        <h3 style="margin:0; color:#28a745;">\u7B2C\u516D\u90E8\u5206\uFF1AToken \u7528\u91CF\u6BCF\u65E5\u7EDF\u8BA1\uFF08\u67F1\u72B6\u56FE\uFF09</h3>
+        <span style="font-size:11px; background:#28a745; color:#fff; padding:2px 8px; border-radius:10px; font-weight:bold;">\u8282\u7701\u5B58\u50A8 \u00B7 \u6309\u65E5\u805A\u5408</span>
+      </div>
+      <p style="font-size:12px; color:#666; margin:8px 0 14px;">
+        \u4EE5\u8282\u7701\u5B58\u50A8\u7684\u65E5\u7EA7\u805A\u5408\u7ED3\u6784\uFF0C\u8BB0\u5F55\u6BCF\u65E5\u8BFB\u53D6\u3001\u7F13\u5B58\u3001\u8F93\u51FA\u4E0E\u601D\u8003 Token\uFF0C\u652F\u6301\u81EA\u5B9A\u4E49\u65F6\u95F4\u8303\u56F4\u67E5\u8BE2\u5E76\u6E32\u67D3\u53EF\u89C6\u5316\u67F1\u72B6\u56FE\u4E0E\u603B\u91CF\u7EDF\u8BA1\u3002
+      </p>
+
+      <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-bottom:14px; background:#f8f9fa; padding:10px 12px; border-radius:6px; border:1px solid #e9ecef;">
+        <span style="font-size:13px; font-weight:bold; color:#495057;">\u65F6\u95F4\u8303\u56F4\uFF1A</span>
+        <button type="button" class="btn-sm token-range-btn" onclick="fetchTokenStats(7, this)" style="background:#007bff; color:#fff;">\u6700\u8FD1 7 \u5929</button>
+        <button type="button" class="btn-sm token-range-btn" onclick="fetchTokenStats(14, this)" style="background:#6c757d; color:#fff;">\u6700\u8FD1 14 \u5929</button>
+        <button type="button" class="btn-sm token-range-btn" onclick="fetchTokenStats(30, this)" style="background:#6c757d; color:#fff;">\u6700\u8FD1 30 \u5929</button>
+        <div style="display:flex; align-items:center; gap:4px; margin-left:auto; flex-wrap:wrap;">
+          <input type="date" id="token-start-date" style="padding:4px 6px; font-size:12px; width:auto; margin:0; border:1px solid #ced4da; border-radius:4px;">
+          <span style="font-size:12px; color:#666;">~</span>
+          <input type="date" id="token-end-date" style="padding:4px 6px; font-size:12px; width:auto; margin:0; border:1px solid #ced4da; border-radius:4px;">
+          <button type="button" class="btn-sm" onclick="fetchTokenStatsCustom()" style="background:#28a745; color:#fff;">\u67E5\u8BE2</button>
+        </div>
+      </div>
+
+      <div id="token-summary-grid" style="display:grid; grid-template-columns:repeat(auto-fit, minmax(105px, 1fr)); gap:8px; margin-bottom:15px;">
+        <div style="background:#f8f9fa; border:1px solid #dee2e6; border-radius:6px; padding:8px 10px; text-align:center;">
+          <div style="font-size:11px; color:#6c757d;">\u8BFB\u53D6 / \u8F93\u5165</div>
+          <div id="token-sum-prompt" style="font-size:15px; font-weight:bold; color:#007bff; margin-top:2px;">0</div>
+        </div>
+        <div style="background:#f8f9fa; border:1px solid #dee2e6; border-radius:6px; padding:8px 10px; text-align:center;">
+          <div style="font-size:11px; color:#6c757d;">\u7F13\u5B58\u547D\u4E2D</div>
+          <div id="token-sum-cached" style="font-size:15px; font-weight:bold; color:#17a2b8; margin-top:2px;">0</div>
+        </div>
+        <div style="background:#f8f9fa; border:1px solid #dee2e6; border-radius:6px; padding:8px 10px; text-align:center;">
+          <div style="font-size:11px; color:#6c757d;">\u6A21\u578B\u8F93\u51FA</div>
+          <div id="token-sum-output" style="font-size:15px; font-weight:bold; color:#28a745; margin-top:2px;">0</div>
+        </div>
+        <div style="background:#f8f9fa; border:1px solid #dee2e6; border-radius:6px; padding:8px 10px; text-align:center;">
+          <div style="font-size:11px; color:#6c757d;">\u601D\u8003 / \u63A8\u7406</div>
+          <div id="token-sum-reasoning" style="font-size:15px; font-weight:bold; color:#fd7e14; margin-top:2px;">0</div>
+        </div>
+        <div style="background:#f8f9fa; border:1px solid #dee2e6; border-radius:6px; padding:8px 10px; text-align:center;">
+          <div style="font-size:11px; color:#6c757d;">\u603B Token \u91CF</div>
+          <div id="token-sum-total" style="font-size:15px; font-weight:bold; color:#6f42c1; margin-top:2px;">0</div>
+        </div>
+        <div style="background:#f8f9fa; border:1px solid #dee2e6; border-radius:6px; padding:8px 10px; text-align:center;">
+          <div style="font-size:11px; color:#6c757d;">\u8BF7\u6C42\u6B21\u6570</div>
+          <div id="token-sum-requests" style="font-size:15px; font-weight:bold; color:#343a40; margin-top:2px;">0</div>
+        </div>
+      </div>
+
+      <div style="display:flex; justify-content:center; gap:14px; font-size:11px; color:#555; margin-bottom:8px; flex-wrap:wrap;">
+        <span style="display:inline-flex; align-items:center; gap:4px;"><span style="display:inline-block; width:10px; height:10px; background:#007bff; border-radius:2px;"></span>\u8BFB\u53D6/Prompt</span>
+        <span style="display:inline-flex; align-items:center; gap:4px;"><span style="display:inline-block; width:10px; height:10px; background:#17a2b8; border-radius:2px;"></span>\u7F13\u5B58 Cached</span>
+        <span style="display:inline-flex; align-items:center; gap:4px;"><span style="display:inline-block; width:10px; height:10px; background:#28a745; border-radius:2px;"></span>\u8F93\u51FA Output</span>
+        <span style="display:inline-flex; align-items:center; gap:4px;"><span style="display:inline-block; width:10px; height:10px; background:#fd7e14; border-radius:2px;"></span>\u601D\u8003 Reasoning</span>
+      </div>
+
+      <div id="token-chart-status" style="font-size:12px; color:#888; text-align:center; padding:10px;">\u52A0\u8F7D\u4E2D...</div>
+      <div id="token-chart-wrapper" style="overflow-x:auto; border:1px solid #dee2e6; border-radius:6px; padding:15px 10px 10px; background:#fff; min-height:220px; display:none;">
+        <svg id="token-bar-svg" style="width:100%; height:200px; display:block;" preserveAspectRatio="none"></svg>
+      </div>
+      <div id="token-bar-detail" style="font-size:12px; color:#495057; background:#e9ecef; border-radius:4px; padding:6px 12px; margin-top:8px; display:none; text-align:center;"></div>
+    </div>` : ''}
 
     <script>
       let chatHistory = [];
@@ -3822,6 +3980,295 @@ async function handleDashboard(request, env) {
 
       if (agQuotaHasAntigravity) {
         loadAntigravityQuota(false);
+      }
+
+      async function fetchRecentAuditLogs() {
+        const nInput = document.getElementById("audit-log-n");
+        const statusEl = document.getElementById("audit-logs-status");
+        const container = document.getElementById("audit-logs-container");
+        const btn = document.getElementById("view-audit-logs-btn");
+        
+        let n = parseInt(nInput ? nInput.value : "10", 10);
+        if (!n || n < 1) n = 10;
+        
+        if (btn) btn.disabled = true;
+        if (statusEl) statusEl.textContent = "\u6B63\u5728\u83B7\u53D6\u6700\u8FD1 " + n + " \u6761\u5B8C\u6574\u8BF7\u6C42\u4E0E\u54CD\u5E94...";
+        
+        try {
+          const res = await fetch("/api/logs/recent?n=" + n);
+          const data = await res.json();
+          if (!res.ok || !data.success) {
+            throw new Error(data.error || ("HTTP " + res.status));
+          }
+          const logs = data.logs || [];
+          if (statusEl) statusEl.textContent = "\u5DF2\u83B7\u53D6\u6700\u8FD1 " + logs.length + " \u6761\u8BB0\u5F55 (n = " + n + "):";
+          if (container) {
+            container.style.display = "block";
+            if (logs.length === 0) {
+              container.innerHTML = '<div style="text-align:center; color:#888; padding:20px; font-size:13px;">\u6682\u65E0\u8BF7\u6C42\u65E5\u5FD7\u8BB0\u5F55\u3002\u53D1\u8D77 API \u8BF7\u6C42\u540E\u5C06\u5728\u6B64\u5904\u5B9E\u65F6\u663E\u793A\u3002</div>';
+              return;
+            }
+            container.innerHTML = "";
+            logs.forEach((log, index) => {
+              const itemEl = document.createElement("div");
+              itemEl.style.cssText = "border: 1px solid #e9ecef; border-radius: 6px; margin-bottom: 12px; background: #fafafa; overflow: hidden;";
+              
+              const statusColor = (log.status_code >= 200 && log.status_code < 300) ? "#28a745" : (log.status_code >= 400 && log.status_code < 500) ? "#fd7e14" : "#dc3545";
+              
+              const headerEl = document.createElement("div");
+              headerEl.style.cssText = "padding: 10px 12px; background: #f1f3f5; cursor: pointer; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px; user-select: none;";
+              
+              const streamTag = log.is_stream ? '<span style="font-size:10px; background:#17a2b8; color:#fff; padding:1px 5px; border-radius:3px;">\u6D41\u5F0F SSE</span>' : '<span style="font-size:10px; background:#6c757d; color:#fff; padding:1px 5px; border-radius:3px;">\u975E\u6D41\u5F0F</span>';
+              const modelTag = log.model ? '<span style="font-size:11px; background:#e2e3f0; color:#383d73; padding:2px 6px; border-radius:3px; font-family:monospace;">' + agEscHtml(log.model) + '</span>' : '';
+              
+              headerEl.innerHTML = 
+                '<div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">' +
+                  '<span style="font-weight:bold; font-size:12px; background:' + statusColor + '; color:#fff; padding:2px 6px; border-radius:3px;">' + (log.status_code || 200) + '</span>' +
+                  '<span style="font-family:monospace; font-weight:bold; font-size:13px; color:#212529;">' + agEscHtml(log.method || 'POST') + ' ' + agEscHtml(log.url || log.path || '') + '</span>' +
+                  modelTag +
+                  streamTag +
+                '</div>' +
+                '<div style="font-size:12px; color:#6c757d; display:flex; align-items:center; gap:8px;">' +
+                  '<span>' + (log.duration_ms != null ? log.duration_ms + 'ms' : '') + '</span>' +
+                  '<span>' + agEscHtml(log.time_formatted || '') + '</span>' +
+                  '<span style="font-size:11px; color:#007bff; text-decoration:underline;">\u5C55\u5F00/\u6298\u53E0</span>' +
+                '</div>';
+              
+              const bodyEl = document.createElement("div");
+              bodyEl.className = "audit-log-body";
+              bodyEl.style.cssText = index === 0 ? "padding: 12px; border-top: 1px solid #e9ecef; background: #fff;" : "display: none; padding: 12px; border-top: 1px solid #e9ecef; background: #fff;";
+              
+              headerEl.onclick = () => {
+                bodyEl.style.display = bodyEl.style.display === "none" ? "block" : "none";
+              };
+              
+              let reqStr = "";
+              try {
+                reqStr = typeof log.request_body === "object" ? JSON.stringify(log.request_body, null, 2) : String(log.request_body || "");
+              } catch (_) { reqStr = String(log.request_body || ""); }
+              
+              let respStr = "";
+              try {
+                respStr = typeof log.response_body === "object" ? JSON.stringify(log.response_body, null, 2) : String(log.response_body || "");
+              } catch (_) { respStr = String(log.response_body || ""); }
+              
+              bodyEl.innerHTML = 
+                (log.account ? '<div style="font-size:12px; color:#555; margin-bottom:8px;"><b>\u4F7F\u7528\u8D26\u53F7:</b> ' + agEscHtml(log.account) + '</div>' : '') +
+                (log.error ? '<div style="font-size:12px; color:#dc3545; margin-bottom:8px;"><b>\u9519\u8BEF\u4FE1\u606F:</b> ' + agEscHtml(log.error) + '</div>' : '') +
+                '<div style="margin-bottom:12px;">' +
+                  '<div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:4px;">' +
+                    '<b style="font-size:12px; color:#495057;">\u5B8C\u6574\u8BF7\u6C42\u4F53 (Request Body):</b>' +
+                    '<button class="btn-sm" style="background:#6c757d; color:#fff;" onclick="copyAuditLogText(this, ' + index + ', \'req\')">\u590D\u5236\u8BF7\u6C42\u4F53</button>' +
+                  '</div>' +
+                  '<pre class="req-pre-' + index + '" style="max-height:240px; overflow-y:auto; background:#f8f9fa; border:1px solid #ced4da; border-radius:4px; padding:8px; font-size:12px; font-family:monospace; white-space:pre-wrap; word-break:break-all; margin:0;"></pre>' +
+                '</div>' +
+                '<div>' +
+                  '<div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:4px;">' +
+                    '<b style="font-size:12px; color:#495057;">\u5B8C\u6574\u54CD\u5E94\u4F53 (Response Body):</b>' +
+                    '<button class="btn-sm" style="background:#6c757d; color:#fff;" onclick="copyAuditLogText(this, ' + index + ', \'resp\')">\u590D\u5236\u54CD\u5E94\u4F53</button>' +
+                  '</div>' +
+                  '<pre class="resp-pre-' + index + '" style="max-height:240px; overflow-y:auto; background:#f8f9fa; border:1px solid #ced4da; border-radius:4px; padding:8px; font-size:12px; font-family:monospace; white-space:pre-wrap; word-break:break-all; margin:0;"></pre>' +
+                '</div>';
+              
+              bodyEl.querySelector(".req-pre-" + index).textContent = reqStr || "(\u7A7A\u8BF7\u6C42\u4F53)";
+              bodyEl.querySelector(".resp-pre-" + index).textContent = respStr || "(\u7A7A\u54CD\u5E94\u4F53)";
+              
+              itemEl.appendChild(headerEl);
+              itemEl.appendChild(bodyEl);
+              container.appendChild(itemEl);
+            });
+          }
+        } catch (err) {
+          if (statusEl) statusEl.innerHTML = '<span style="color:#dc3545;">\u83B7\u53D6\u65E5\u5FD7\u5931\u8D25: ' + agEscHtml(err.message) + '</span>';
+        } finally {
+          if (btn) btn.disabled = false;
+        }
+      }
+
+      function copyAuditLogText(btn, index, type) {
+        const pre = document.querySelector("." + type + "-pre-" + index);
+        if (!pre) return;
+        const text = pre.textContent;
+        navigator.clipboard.writeText(text).then(() => {
+          const old = btn.textContent;
+          btn.textContent = "\u5DF2\u590D\u5236!";
+          setTimeout(() => { btn.textContent = old; }, 1500);
+        }).catch(() => {
+          alert("\u590D\u5236\u5931\u8D25\uFF0C\u8BF7\u624B\u52A8\u9009\u62E9\u590D\u5236");
+        });
+      }
+
+      async function clearAuditLogs() {
+        if (!confirm("\u786E\u5B9A\u8981\u6E05\u7A7A\u6240\u6709\u5DF2\u4FDD\u5B58\u7684\u8BF7\u6C42\u4E0E\u54CD\u5E94\u65E5\u5FD7\u5417\uFF1F")) return;
+        const statusEl = document.getElementById("audit-logs-status");
+        const container = document.getElementById("audit-logs-container");
+        try {
+          const res = await fetch("/api/logs/clear", { method: "POST" });
+          const d = await res.json();
+          if (d.success) {
+            if (statusEl) statusEl.textContent = "\u5DF2\u6E05\u7A7A\u65E5\u5FD7\u8BB0\u5F55\u3002";
+            if (container) container.innerHTML = '<div style="text-align:center; color:#888; padding:20px; font-size:13px;">\u6682\u65E0\u8BF7\u6C42\u65E5\u5FD7\u8BB0\u5F55\u3002</div>';
+          } else {
+            alert("\u6E05\u7A7A\u5931\u8D25: " + (d.error || "\u672A\u77E5\u9519\u8BEF"));
+          }
+        } catch (e) {
+          alert("\u8BF7\u6C42\u5931\u8D25: " + e.message);
+        }
+      }
+
+      function fmtTokens(n) {
+        n = Number(n) || 0;
+        if (n >= 1000000) return (n / 1000000).toFixed(2) + "M";
+        if (n >= 1000) return (n / 1000).toFixed(1) + "k";
+        return String(n);
+      }
+      function fmtTokensFull(n) {
+        return Number(n || 0).toLocaleString();
+      }
+
+      async function fetchTokenStats(days, btnEl) {
+        if (btnEl) {
+          document.querySelectorAll(".token-range-btn").forEach(b => {
+            b.style.background = "#6c757d";
+          });
+          btnEl.style.background = "#007bff";
+        }
+        const statusEl = document.getElementById("token-chart-status");
+        if (statusEl) { statusEl.style.display = "block"; statusEl.textContent = "\u6B63\u5728\u83B7\u53D6 Token \u7528\u91CF\u6570\u636E..."; }
+        try {
+          const res = await fetch("/api/token-stats?days=" + days);
+          const data = await res.json();
+          if (!res.ok || !data.success) throw new Error(data.error || ("HTTP " + res.status));
+          renderTokenBarChart(data);
+        } catch (e) {
+          if (statusEl) statusEl.textContent = "\u83B7\u53D6 Token \u7528\u91CF\u5931\u8D25: " + e.message;
+        }
+      }
+
+      async function fetchTokenStatsCustom() {
+        const start = document.getElementById("token-start-date") ? document.getElementById("token-start-date").value : "";
+        const end = document.getElementById("token-end-date") ? document.getElementById("token-end-date").value : "";
+        if (!start || !end) {
+          alert("\u8BF7\u9009\u62E9\u5F00\u59CB\u548C\u7ED3\u675F\u65E5\u671F");
+          return;
+        }
+        document.querySelectorAll(".token-range-btn").forEach(b => {
+          b.style.background = "#6c757d";
+        });
+        const statusEl = document.getElementById("token-chart-status");
+        if (statusEl) { statusEl.style.display = "block"; statusEl.textContent = "\u6B63\u5728\u83B7\u53D6 Token \u7528\u91CF\u6570\u636E..."; }
+        try {
+          const res = await fetch("/api/token-stats?start=" + encodeURIComponent(start) + "&end=" + encodeURIComponent(end));
+          const data = await res.json();
+          if (!res.ok || !data.success) throw new Error(data.error || ("HTTP " + res.status));
+          renderTokenBarChart(data);
+        } catch (e) {
+          if (statusEl) statusEl.textContent = "\u83B7\u53D6 Token \u7528\u91CF\u5931\u8D25: " + e.message;
+        }
+      }
+
+      function renderTokenBarChart(data) {
+        const statusEl = document.getElementById("token-chart-status");
+        const wrapper = document.getElementById("token-chart-wrapper");
+        const svg = document.getElementById("token-bar-svg");
+        const sum = data.summary || {};
+        const daily = data.daily || [];
+
+        const promptEl = document.getElementById("token-sum-prompt");
+        if (promptEl) promptEl.textContent = fmtTokens(sum.prompt_tokens);
+        const cachedEl = document.getElementById("token-sum-cached");
+        if (cachedEl) cachedEl.textContent = fmtTokens(sum.cached_tokens);
+        const outEl = document.getElementById("token-sum-output");
+        if (outEl) outEl.textContent = fmtTokens(sum.output_tokens);
+        const rsnEl = document.getElementById("token-sum-reasoning");
+        if (rsnEl) rsnEl.textContent = fmtTokens(sum.reasoning_tokens);
+        const totEl = document.getElementById("token-sum-total");
+        if (totEl) totEl.textContent = fmtTokens(sum.total_tokens);
+        const reqEl = document.getElementById("token-sum-requests");
+        if (reqEl) reqEl.textContent = fmtTokensFull(sum.request_count);
+
+        if (statusEl) statusEl.style.display = "none";
+        if (wrapper) wrapper.style.display = "block";
+        if (!svg) return;
+
+        const maxTotal = Math.max(100, ...daily.map(d => d.total_tokens || 0));
+        const chartHeight = 150;
+        const colWidth = Math.max(45, Math.floor(660 / Math.max(1, daily.length)));
+        const totalSvgWidth = Math.max(660, daily.length * colWidth);
+        const barWidth = Math.max(16, Math.floor(colWidth * 0.65));
+
+        svg.setAttribute("viewBox", "0 0 " + totalSvgWidth + " 210");
+        svg.style.width = daily.length > 14 ? (totalSvgWidth + "px") : "100%";
+
+        let svgHtml = "";
+        for (let i = 0; i <= 4; i++) {
+          const y = chartHeight - (chartHeight / 4) * i + 20;
+          const val = Math.round((maxTotal / 4) * i);
+          svgHtml += '<line x1="0" y1="' + y + '" x2="' + totalSvgWidth + '" y2="' + y + '" stroke="#f1f3f5" stroke-width="1" />';
+          if (i > 0) {
+            svgHtml += '<text x="4" y="' + (y - 3) + '" fill="#adb5bd" font-size="10" font-family="sans-serif">' + fmtTokens(val) + '</text>';
+          }
+        }
+
+        daily.forEach((d, idx) => {
+          const x = idx * colWidth + Math.floor((colWidth - barWidth) / 2);
+          const total = d.total_tokens || 0;
+
+          const hPrompt = total > 0 ? Math.round(((d.prompt_tokens || 0) / maxTotal) * chartHeight) : 0;
+          const hCached = total > 0 ? Math.round(((d.cached_tokens || 0) / maxTotal) * chartHeight) : 0;
+          const hOutput = total > 0 ? Math.round(((d.output_tokens || 0) / maxTotal) * chartHeight) : 0;
+          const hReasoning = total > 0 ? Math.round(((d.reasoning_tokens || 0) / maxTotal) * chartHeight) : 0;
+
+          const baseBottom = chartHeight + 20;
+          let currentY = baseBottom;
+
+          let barParts = "";
+          if (hPrompt > 0) {
+            currentY -= hPrompt;
+            barParts += '<rect x="' + x + '" y="' + currentY + '" width="' + barWidth + '" height="' + hPrompt + '" fill="#007bff" rx="0" />';
+          }
+          if (hCached > 0) {
+            currentY -= hCached;
+            barParts += '<rect x="' + x + '" y="' + currentY + '" width="' + barWidth + '" height="' + hCached + '" fill="#17a2b8" rx="0" />';
+          }
+          if (hOutput > 0) {
+            currentY -= hOutput;
+            barParts += '<rect x="' + x + '" y="' + currentY + '" width="' + barWidth + '" height="' + hOutput + '" fill="#28a745" rx="0" />';
+          }
+          if (hReasoning > 0) {
+            currentY -= hReasoning;
+            barParts += '<rect x="' + x + '" y="' + currentY + '" width="' + barWidth + '" height="' + hReasoning + '" fill="#fd7e14" rx="0" />';
+          }
+          if (total === 0) {
+            barParts += '<rect x="' + x + '" y="' + (baseBottom - 2) + '" width="' + barWidth + '" height="' + 2 + '" fill="#dee2e6" rx="1" />';
+          }
+
+          const labelTop = total > 0 ? '<text x="' + (x + barWidth / 2) + '" y="' + (currentY - 4) + '" text-anchor="middle" fill="#6c757d" font-size="10" font-weight="bold" font-family="sans-serif">' + fmtTokens(total) + '</text>' : '';
+          const dateShort = d.date.length >= 10 ? d.date.slice(5) : d.date;
+          const labelDate = '<text x="' + (x + barWidth / 2) + '" y="' + (baseBottom + 16) + '" text-anchor="middle" fill="#495057" font-size="11" font-family="sans-serif">' + dateShort + '</text>';
+          const hoverArea = '<rect x="' + (idx * colWidth) + '" y="0" width="' + colWidth + '" height="210" fill="transparent" style="cursor:pointer;" onmouseover="showTokenBarInfo(' + idx + ')" onclick="showTokenBarInfo(' + idx + ')" />';
+
+          svgHtml += '<g class="bar-group-' + idx + '">' + barParts + labelTop + labelDate + hoverArea + '</g>';
+        });
+
+        svg.innerHTML = svgHtml;
+        window.__TOKEN_DAILY_DATA__ = daily;
+        if (daily.length > 0) {
+          showTokenBarInfo(daily.length - 1);
+        }
+      }
+
+      function showTokenBarInfo(idx) {
+        const daily = window.__TOKEN_DAILY_DATA__;
+        const detailEl = document.getElementById("token-bar-detail");
+        if (!daily || !daily[idx] || !detailEl) return;
+        const d = daily[idx];
+        detailEl.style.display = "block";
+        detailEl.innerHTML = '<b>' + agEscHtml(d.date) + '</b> \u00B7 \u603B Token: <b>' + fmtTokensFull(d.total_tokens) + '</b> (\u8BFB\u53D6: <span style="color:#007bff;font-weight:bold;">' + fmtTokensFull(d.prompt_tokens) + '</span> \u00B7 \u7F13\u5B58: <span style="color:#17a2b8;font-weight:bold;">' + fmtTokensFull(d.cached_tokens) + '</span> \u00B7 \u8F93\u51FA: <span style="color:#28a745;font-weight:bold;">' + fmtTokensFull(d.output_tokens) + '</span> \u00B7 \u601D\u8003: <span style="color:#fd7e14;font-weight:bold;">' + fmtTokensFull(d.reasoning_tokens) + '</span>) \u00B7 \u8BF7\u6C42\u6B21\u6570: <b>' + d.request_count + '</b> \u6B21';
+      }
+
+      if (${isVps ? "true" : "false"}) {
+        fetchTokenStats(7);
       }
     <\/script>
 
@@ -5282,24 +5729,78 @@ async function handleModelsList(request, env, ctx, customPath) {
 __name(handleModelsList, "handleModelsList");
 __name2(handleModelsList, "handleModelsList");
 async function handleApiProxy(request, env, ctx, customPath, apiType) {
+  const auditStartTime = Date.now();
+  let auditEntry = null;
+  if (env?.auditLogStore) {
+    auditEntry = {
+      id: "log_" + auditStartTime + "_" + generateRandomString(6),
+      timestamp: auditStartTime,
+      time_formatted: new Date(auditStartTime).toLocaleString("zh-CN", { hour12: false }),
+      method: request.method || "POST",
+      url: new URL(request.url).pathname,
+      path: "/" + [customPath, apiType].filter(Boolean).join("/"),
+      api_type: apiType,
+      model: null,
+      account: null,
+      status_code: 200,
+      is_stream: false,
+      duration_ms: 0,
+      username: null,
+      request_body: null,
+      response_body: null,
+      error: null
+    };
+  }
+
+  const recordAuditError = (status, errorPayload) => {
+    if (!auditEntry || !env?.auditLogStore) return;
+    auditEntry.status_code = status;
+    auditEntry.duration_ms = Date.now() - auditStartTime;
+    auditEntry.error = typeof errorPayload === "string" ? errorPayload : (errorPayload?.error?.message || errorPayload?.error || JSON.stringify(errorPayload));
+    auditEntry.response_body = errorPayload;
+    if (ctx?.waitUntil) {
+      ctx.waitUntil(Promise.resolve(env.auditLogStore.addLog(auditEntry)).catch(() => {}));
+    } else {
+      Promise.resolve(env.auditLogStore.addLog(auditEntry)).catch(() => {});
+    }
+  };
+
+  const recordAuditSuccess = (resBody, usage = null) => {
+    if (!auditEntry || !env?.auditLogStore) return;
+    auditEntry.status_code = 200;
+    auditEntry.duration_ms = Date.now() - auditStartTime;
+    auditEntry.response_body = resBody;
+    if (usage) auditEntry.usage = usage;
+    if (ctx?.waitUntil) {
+      ctx.waitUntil(Promise.resolve(env.auditLogStore.addLog(auditEntry)).catch(() => {}));
+    } else {
+      Promise.resolve(env.auditLogStore.addLog(auditEntry)).catch(() => {});
+    }
+  };
+
   const responseProtocol = apiType === "openai-responses";
   const apiKey = extractApiKey(request);
   let username = null;
   if (apiKey) {
     username = await env.GEMINI_KV.get(`key:${apiKey}`);
     if (!username) {
+      recordAuditError(401, { error: "Unauthorized: Invalid API Key" });
       return jsonResponse({ error: "Unauthorized: Invalid API Key" }, 401);
     }
   } else if (customPath) {
     username = await env.GEMINI_KV.get(`path:${customPath}`);
     if (!username) {
+      recordAuditError(401, { error: "Unauthorized: Invalid Custom Path" });
       return jsonResponse({ error: "Unauthorized: Invalid Custom Path" }, 401);
     }
   } else {
+    recordAuditError(401, { error: "Unauthorized: Missing credentials" });
     return jsonResponse({ error: "Unauthorized: Missing credentials" }, 401);
   }
+  if (auditEntry) auditEntry.username = username;
   const user = await env.GEMINI_KV.get(`user:${username}`, "json");
   if (!user) {
+    recordAuditError(404, { error: "User not found" });
     return jsonResponse({ error: "User not found" }, 404);
   }
   let userStateDirty = false;
@@ -5311,7 +5812,15 @@ async function handleApiProxy(request, env, ctx, customPath, apiType) {
   let body;
   try {
     body = await request.json();
+    if (auditEntry) {
+      try {
+        auditEntry.request_body = structuredClone(body);
+      } catch (_) {
+        auditEntry.request_body = body;
+      }
+    }
   } catch (e) {
+    recordAuditError(400, { error: "Invalid JSON payload" });
     return jsonResponse({ error: "Invalid JSON payload" }, 400);
   }
   let toolMetaMap = null;
@@ -5331,10 +5840,16 @@ async function handleApiProxy(request, env, ctx, customPath, apiType) {
   }
   const geminiRoute = apiType === "gemini" ? getGeminiRouteInfo(request) : null;
   const inputModel = body.model || geminiRoute?.model || "gemini-3-flash-preview";
+  if (auditEntry) {
+    auditEntry.model = inputModel;
+    auditEntry.is_stream = Boolean(body.stream === true || geminiRoute?.stream === true);
+  }
   if ((apiType === "openai" || apiType === "claude") && !responseFastPath && !Array.isArray(body.messages)) {
+    recordAuditError(400, { error: "`messages` must be an array" });
     return jsonResponse({ error: "`messages` must be an array" }, 400);
   }
   if (apiType === "gemini" && !Array.isArray(body.contents)) {
+    recordAuditError(400, { error: "`contents` must be an array" });
     return jsonResponse({ error: "`contents` must be an array" }, 400);
   }
   const requestColo = request?.cf?.colo || null;
@@ -5355,9 +5870,11 @@ async function handleApiProxy(request, env, ctx, customPath, apiType) {
     mode = "codeassist";
     physicalModel = caMatch;
   } else {
-    return jsonResponse({
+    const errPayload = {
       error: `Model '${inputModel}' does not match configured rules. (CodeAssist: ${caPattern}, Antigravity: ${antigravity_pattern})`
-    }, 400);
+    };
+    recordAuditError(400, errPayload);
+    return jsonResponse(errPayload, 400);
   }
   const resolvedModel = physicalModel;
   const isClaudeModel = resolvedModel.toLowerCase().includes("claude");
@@ -5372,9 +5889,11 @@ async function handleApiProxy(request, env, ctx, customPath, apiType) {
       (a.tokens.access_token || a.tokens.refresh_token)
     );
     if (!requestedAccount) {
-      return jsonResponse({
+      const errPayload = {
         error: `指定账号不可用或与模型模式不匹配: ${requestedAccountId}`
-      }, 400);
+      };
+      recordAuditError(400, errPayload);
+      return jsonResponse(errPayload, 400);
     }
     candidateAccounts = [requestedAccount];
   } else {
@@ -5386,9 +5905,11 @@ async function handleApiProxy(request, env, ctx, customPath, apiType) {
     );
   }
   if (candidateAccounts.length === 0) {
-    return jsonResponse({
+    const errPayload = {
       error: `Google OAuth not configured for mode: ${mode}. Please add an account in the Dashboard.`
-    }, 403);
+    };
+    recordAuditError(403, errPayload);
+    return jsonResponse(errPayload, 403);
   }
   const sortedAccounts = requestedAccountId
     ? candidateAccounts
@@ -6225,10 +6746,16 @@ async function handleApiProxy(request, env, ctx, customPath, apiType) {
   if (!successfulAccount) {
     releaseInFlight();
     await persistUserIfDirty();
-    if (lastAccountError?.response) return lastAccountError.response;
-    return jsonResponse({
+    const errStatus = lastAccountError?.status || 502;
+    const errPayload = {
       error: lastAccountError?.error || "All candidate Google accounts failed to fulfill the request"
-    }, lastAccountError?.status || 502);
+    };
+    recordAuditError(errStatus, lastAccountError?.response ? { error: "Upstream account error", status: errStatus } : errPayload);
+    if (lastAccountError?.response) return lastAccountError.response;
+    return jsonResponse(errPayload, errStatus);
+  }
+  if (auditEntry && successfulAccount) {
+    auditEntry.account = `${successfulAccount.email || successfulAccount.id} (${successfulAccount.mode || mode || "unknown"})`;
   }
   googleRes = finalGoogleRes;
   if (isStream) {
@@ -6284,7 +6811,37 @@ async function handleApiProxy(request, env, ctx, customPath, apiType) {
         }
       })();
     }
-    return new Response(readable, {
+    let returnReadable = readable;
+    if (auditEntry && env?.auditLogStore) {
+      const [clientStream, auditStream] = readable.tee();
+      returnReadable = clientStream;
+      const captureStream = async () => {
+        try {
+          const reader = auditStream.getReader();
+          const decoder = new TextDecoder();
+          let accumulated = "";
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            if (value) accumulated += decoder.decode(value, { stream: true });
+          }
+          accumulated += decoder.decode();
+          auditEntry.status_code = 200;
+          auditEntry.duration_ms = Date.now() - auditStartTime;
+          auditEntry.response_body = accumulated;
+          if (responseData?.usageMetadata || responseData?.response?.usageMetadata) {
+            auditEntry.usage = responseData?.usageMetadata || responseData?.response?.usageMetadata;
+          }
+          await env.auditLogStore.addLog(auditEntry);
+        } catch (_) {}
+      };
+      if (ctx?.waitUntil) {
+        ctx.waitUntil(captureStream());
+      } else {
+        captureStream().catch(() => {});
+      }
+    }
+    return new Response(returnReadable, {
       headers: {
         "Content-Type": "text/event-stream",
         "Cache-Control": "no-cache",
@@ -6317,7 +6874,9 @@ async function handleApiProxy(request, env, ctx, customPath, apiType) {
       }
     }
     if (responseProtocol) {
-      return jsonResponse(googleResponseToResponses(data, inputModel, mode, toolMetaMap));
+      const respPayload = googleResponseToResponses(data, inputModel, mode, toolMetaMap);
+      recordAuditSuccess(respPayload, data?.response?.usageMetadata || data?.usageMetadata);
+      return jsonResponse(respPayload);
     }
     if (apiType === "openai") {
       const raw = data.response || data;
@@ -6386,6 +6945,7 @@ async function handleApiProxy(request, env, ctx, customPath, apiType) {
           } : void 0
         } : void 0
       };
+      recordAuditSuccess(oaiResponse, raw.usageMetadata);
       return jsonResponse(oaiResponse);
     } else if (apiType === "claude") {
       const raw = data.response || data;
@@ -6453,8 +7013,10 @@ async function handleApiProxy(request, env, ctx, customPath, apiType) {
           cache_read_input_tokens: raw.usageMetadata.cachedContentTokenCount || 0
         } : void 0
       };
+      recordAuditSuccess(claudeResponse, raw.usageMetadata);
       return jsonResponse(claudeResponse);
     } else {
+      recordAuditSuccess(data, data?.response?.usageMetadata || data?.usageMetadata);
       return jsonResponse(data);
     }
   }
@@ -6496,6 +7058,9 @@ var worker_default = {
       if (url.pathname === "/api/user/update") return await handleUserUpdate(request, env);
       if (url.pathname === "/api/user/account") return await handleAccountApi(request, env, ctx);
       if (url.pathname === "/api/antigravity/quota") return await handleAntigravityQuota(request, env, ctx);
+      if (url.pathname === "/api/logs/recent") return await handleGetRecentLogs(request, env);
+      if (url.pathname === "/api/logs/clear") return await handleClearAuditLogs(request, env);
+      if (url.pathname === "/api/token-stats") return await handleGetTokenStats(request, env);
       const parts = url.pathname.split("/").filter(Boolean);
       let customPath = null;
       let remainingPath = "";

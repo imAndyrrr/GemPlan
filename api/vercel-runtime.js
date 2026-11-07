@@ -2,6 +2,7 @@ import { Readable } from "node:stream";
 import { once } from "node:events";
 import fs from "node:fs";
 import path from "node:path";
+import { createAuditLogStore, createTokenStatsStore } from "./audit-log-store.js";
 import { createMemoryOrRestKV, createRestCache, MemoryKV } from "./vercel-kv.js";
 
 function loadLocalEnvFile() {
@@ -125,6 +126,13 @@ export function createRuntimeEnvironment(source = process.env) {
     configurable: true,
     writable: true
   });
+  const mode = (env.KV_MODE || process.env.KV_MODE || "").toLowerCase();
+  const isVps = mode === "local" || env.LOCAL_STORE === "1" || Boolean(env.DATA_STORE_PATH) || env.IS_VPS === "true" || env.IS_VPS === true || env.IS_VPS === "1";
+  if (isVps) {
+    env.IS_VPS = "true";
+    env.auditLogStore = createAuditLogStore(env);
+    env.tokenStatsStore = createTokenStatsStore(env);
+  }
   return env;
 }
 

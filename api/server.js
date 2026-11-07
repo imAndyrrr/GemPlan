@@ -6,6 +6,7 @@ import { createRuntimeEnvironment, handleNodeRequest } from "./vercel-runtime.js
 
 // Ensure standalone Node server defaults to purely local file-backed store (zero Cloudflare KV calls)
 process.env.KV_MODE = process.env.KV_MODE || "local";
+process.env.IS_VPS = process.env.IS_VPS || "true";
 
 const port = Number(process.env.PORT || 8000);
 const host = process.env.HOST || "0.0.0.0";
