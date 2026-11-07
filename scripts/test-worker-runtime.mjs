@@ -1115,7 +1115,7 @@ try {
     if (totalWait > 20000) {
       throw new Error(`wait budget exceeded: ${totalWait}ms planned (${JSON.stringify(plannedWaits)})`);
     }
-    if (generationCalls !== 6) {
+    if (generationCalls !== 4) {
       throw new Error(`budget must stop after the second attempt: ${generationCalls} generation calls (${JSON.stringify(plannedWaits)})`);
     }
     if (plannedWaits.length === 0) {
@@ -1173,8 +1173,8 @@ try {
     if (quotaProbes.length !== 0) {
       throw new Error(`cold quota cache must not trigger a refresh: ${JSON.stringify(quotaProbes)}`);
     }
-    if (generationCalls.length !== 9) {
-      throw new Error(`cold-cache 429 must keep the 3 x 3 attempt budget: ${generationCalls.length} generation calls`);
+    if (generationCalls.length !== 6) {
+      throw new Error(`cold-cache 429 must keep the 3 x 2 attempt budget: ${generationCalls.length} generation calls`);
     }
     console.log("PASS: cold quota cache skips the quota refresh during 429 recovery");
   }

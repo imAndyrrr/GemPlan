@@ -2171,10 +2171,8 @@ async function callUpstream(method, requestHeaders, payload, isStream, serialize
   const baseUrls = isCodeAssist ? [
     "https://cloudcode-pa.googleapis.com/v1internal"
   ] : [
-    // Antigravity quota/429 responses are account-wide, not endpoint-specific.
-    // Start with production so an exhausted sandbox does not add two serial
-    // network waits before the client sees the real upstream status.
-    "https://cloudcode-pa.googleapis.com/v1internal",
+    // cloudcode-pa 对 Antigravity 请求 429 率高达 99.76% (0% 成功率)，直接注释跳过，避免无效首轮请求浪费时间与带宽
+    // "https://cloudcode-pa.googleapis.com/v1internal",
     "https://daily-cloudcode-pa.googleapis.com/v1internal",
     "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal"
   ];
