@@ -26,6 +26,7 @@ const __name2 = (f) => f;
 ${extract("checkModelQuota")}
 ${extract("getUserAccounts")}
 const accountUsageMemory = new Map();
+const accountInFlightMemory = new Map();
 const TRANSIENT_CACHE_MAX_ENTRIES = 2048;
 const transientJsonCache = new Map();
 const sessionIdCache = new Map();
@@ -44,6 +45,10 @@ function seedQuota(username, accountId, value) {
 ${extract("getAccountUsageKey")}
 ${extract("getEffectiveLastUsed")}
 ${extract("recordAccountUsage")}
+${extract("getAccountInFlightKey")}
+${extract("getAccountInFlight")}
+${extract("incrementAccountInFlight")}
+${extract("decrementAccountInFlight")}
 ${extract("getAccountEligibilityKey")}
 ${extract("getAccountEligibilityBlockUntil")}
 ${extract("getAccountEligibilityBlocks")}
@@ -59,6 +64,9 @@ globalThis.__testFns = {
   checkModelQuota,
   getUserAccounts,
   recordAccountUsage,
+  incrementAccountInFlight,
+  decrementAccountInFlight,
+  getAccountInFlight,
   saveUser,
   rankAccountsForRequest,
   getAccountEligibilityBlocks,
@@ -66,7 +74,7 @@ globalThis.__testFns = {
 };
 `;
 new Function(code)();
-const { deriveSessionId, checkModelQuota, getUserAccounts, recordAccountUsage, saveUser, rankAccountsForRequest, getAccountEligibilityBlocks, seedQuota } = globalThis.__testFns;
+const { deriveSessionId, checkModelQuota, getUserAccounts, recordAccountUsage, incrementAccountInFlight, decrementAccountInFlight, getAccountInFlight, saveUser, rankAccountsForRequest, getAccountEligibilityBlocks, seedQuota } = globalThis.__testFns;
 
 // Test 1: Legacy user migration
 const legacyUser = {
@@ -422,5 +430,18 @@ try {
   if (originalCaches === undefined) delete globalThis.caches;
   else globalThis.caches = originalCaches;
 }
+
+// Test: In-flight active concurrency load-balancing
+const concurrentAccounts = [
+  { id: "acc_busy", mode: "antigravity", enabled: true, status: "active", priority: 10, last_used_at: 100 },
+  { id: "acc_idle", mode: "antigravity", enabled: true, status: "active", priority: 10, last_used_at: 200 }
+];
+incrementAccountInFlight("concurrent-user", "acc_busy");
+const rankedConcurrent = await rankAccountsForRequest(concurrentAccounts, "gemini-2.5-flash", "concurrent-user", { GEMINI_KV: mockKV });
+if (rankedConcurrent[0].id !== "acc_idle") {
+  throw new Error(`Expected idle account 'acc_idle' to take precedence over busy account, got ${rankedConcurrent[0].id}`);
+}
+decrementAccountInFlight("concurrent-user", "acc_busy");
+console.log("PASS: In-flight concurrency load-balancing routes requests away from busy accounts");
 
 console.log("\nALL MULTI-ACCOUNT & QUOTA TESTS PASSED!");

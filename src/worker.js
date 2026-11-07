@@ -3956,6 +3956,39 @@ function recordAccountUsage(username, account, timestamp = Math.floor(Date.now()
 __name(recordAccountUsage, "recordAccountUsage");
 __name2(recordAccountUsage, "recordAccountUsage");
 
+const accountInFlightMemory = /* @__PURE__ */ new Map();
+function getAccountInFlightKey(username, accountId) {
+  return `${username}\0${accountId}`;
+}
+__name(getAccountInFlightKey, "getAccountInFlightKey");
+__name2(getAccountInFlightKey, "getAccountInFlightKey");
+function getAccountInFlight(username, accountId) {
+  if (!username || !accountId) return 0;
+  return accountInFlightMemory.get(getAccountInFlightKey(username, accountId)) || 0;
+}
+__name(getAccountInFlight, "getAccountInFlight");
+__name2(getAccountInFlight, "getAccountInFlight");
+function incrementAccountInFlight(username, accountId) {
+  if (!username || !accountId) return;
+  const key = getAccountInFlightKey(username, accountId);
+  const current = accountInFlightMemory.get(key) || 0;
+  accountInFlightMemory.set(key, current + 1);
+}
+__name(incrementAccountInFlight, "incrementAccountInFlight");
+__name2(incrementAccountInFlight, "incrementAccountInFlight");
+function decrementAccountInFlight(username, accountId) {
+  if (!username || !accountId) return;
+  const key = getAccountInFlightKey(username, accountId);
+  const current = accountInFlightMemory.get(key) || 0;
+  if (current <= 1) {
+    accountInFlightMemory.delete(key);
+  } else {
+    accountInFlightMemory.set(key, current - 1);
+  }
+}
+__name(decrementAccountInFlight, "decrementAccountInFlight");
+__name2(decrementAccountInFlight, "decrementAccountInFlight");
+
 // A short 429 cooldown is runtime scheduling state, not durable account
 // configuration. Persisting the whole user object for every failover can hit
 // the KV daily write limit under concurrent traffic. Keep the cooldown in the
@@ -4088,6 +4121,22 @@ __name2(getAccountCooldowns, "getAccountCooldowns");
 
 async function saveUser(env, user, username) {
   if (!user || !username || !env?.GEMINI_KV) return;
+  try {
+    const latestRaw = await env.GEMINI_KV.get(`user:${username}`);
+    if (latestRaw) {
+      const latestUser = typeof latestRaw === "string" ? JSON.parse(latestRaw) : latestRaw;
+      if (latestUser && Array.isArray(latestUser.accounts)) {
+        const latestAccountMap = new Map(latestUser.accounts.map((a) => [a.id, a]));
+        for (const acc of user.accounts || []) {
+          const latestAcc = latestAccountMap.get(acc.id);
+          if (latestAcc?.tokens && (latestAcc.tokens.expires_at || 0) > (acc.tokens?.expires_at || 0)) {
+            acc.tokens = latestAcc.tokens;
+          }
+        }
+      }
+    }
+  } catch (_) {}
+
   const accounts = Array.isArray(user.accounts) ? user.accounts : [];
   const activeAg = accounts.find((a) => a.mode === "antigravity" && a.enabled !== false && a.status !== "error");
   const fallbackAg = accounts.find((a) => a.mode === "antigravity");
@@ -4258,16 +4307,22 @@ async function rankAccountsForRequest(accounts, resolvedModel, username, env, co
 
     const lastUsed = getEffectiveLastUsed(username, acc);
     const priority = getAccountPriority(acc);
+    const inFlight = getAccountInFlight(username, acc.id);
     // Healthy/available accounts should always be selected before cooling/error accounts,
     // even if the cooling account has a nominally higher manual priority.
     const isAvailable = score > 0 ? 1 : 0;
-    scored.push({ account: acc, score, lastUsed, priority, isAvailable });
+    scored.push({ account: acc, score, lastUsed, priority, isAvailable, inFlight });
   }
 
-  // Availability first, then strict manual priority tier, then quota/status
-  // score, then LRU tie-breaker. A known account-local eligibility block does
-  // not override the operator's explicit priority ordering.
-  scored.sort((a, b) => b.isAvailable - a.isAvailable || b.priority - a.priority || b.score - a.score || a.lastUsed - b.lastUsed);
+  // Availability first, then strict manual priority tier, then in-flight concurrency,
+  // then quota/status score, then LRU tie-breaker.
+  scored.sort((a, b) =>
+    b.isAvailable - a.isAvailable ||
+    b.priority - a.priority ||
+    a.inFlight - b.inFlight ||
+    b.score - a.score ||
+    a.lastUsed - b.lastUsed
+  );
   return scored.map((s) => s.account);
 }
 __name(rankAccountsForRequest, "rankAccountsForRequest");
@@ -5837,8 +5892,18 @@ async function handleApiProxy(request, env, ctx, customPath, apiType) {
   let recoveryRound = 0;
   let lastTransient429Account = null;
   let lastTransient429RetryAt = 0;
+  let activeInFlightAccountId = null;
+  const releaseInFlight = () => {
+    if (activeInFlightAccountId) {
+      decrementAccountInFlight(username, activeInFlightAccountId);
+      activeInFlightAccountId = null;
+    }
+  };
   for (let accIdx = 0; accIdx < accountQueue.length; accIdx++) {
     const currentAccount = accountQueue[accIdx];
+    releaseInFlight();
+    activeInFlightAccountId = currentAccount.id;
+    incrementAccountInFlight(username, activeInFlightAccountId);
     const hasNextAccount = accIdx + 1 < accountQueue.length;
     const tokenRes = await ensureValidAccountToken(currentAccount, mode, env, user, username, ctx);
     if (tokenRes.changed) userStateDirty = true;
@@ -6160,6 +6225,7 @@ async function handleApiProxy(request, env, ctx, customPath, apiType) {
     }
   }
   if (!successfulAccount) {
+    releaseInFlight();
     await persistUserIfDirty();
     if (lastAccountError?.response) return lastAccountError.response;
     return jsonResponse({
@@ -6184,6 +6250,8 @@ async function handleApiProxy(request, env, ctx, customPath, apiType) {
             const w = writable.getWriter();
             await w.close();
           } catch (_) {}
+        } finally {
+          releaseInFlight();
         }
       })();
     } else if (!useStreamUpstream) {
@@ -6198,6 +6266,8 @@ async function handleApiProxy(request, env, ctx, customPath, apiType) {
             await writer.close();
           } catch (_) {
           }
+        } finally {
+          releaseInFlight();
         }
       })();
     } else {
@@ -6211,6 +6281,8 @@ async function handleApiProxy(request, env, ctx, customPath, apiType) {
             await w.close();
           } catch (_) {
           }
+        } finally {
+          releaseInFlight();
         }
       })();
     }
@@ -6224,6 +6296,7 @@ async function handleApiProxy(request, env, ctx, customPath, apiType) {
       }
     });
   } else {
+    releaseInFlight();
     const data = responseData;
     if (sessionId) {
       let responseSig = null;

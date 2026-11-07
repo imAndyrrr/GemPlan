@@ -126,6 +126,13 @@ export function createResponsesStreamProcessor(writableStream, inputModel, mode,
     } catch (_) {
     }
   };
+  const sendKeepAlive = async () => {
+    if (closed || finished) return;
+    try {
+      await writer.write(encoder.encode(": keep-alive\n\n"));
+    } catch (_) {
+    }
+  };
   const ensureStarted = async () => {
     if (started) return;
     started = true;
@@ -339,7 +346,7 @@ export function createResponsesStreamProcessor(writableStream, inputModel, mode,
     await close();
     return true;
   };
-  return { processData, processLine, finish, close };
+  return { processData, processLine, finish, close, sendKeepAlive };
 }
 
 export async function processResponsesSseStream(readableStream, writableStream, inputModel, mode, toolToNamespaceMap = null) {
@@ -347,6 +354,20 @@ export async function processResponsesSseStream(readableStream, writableStream, 
   const reader = readableStream.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
+  let heartbeatTimer = null;
+  const startHeartbeat = () => {
+    if (heartbeatTimer) clearInterval(heartbeatTimer);
+    heartbeatTimer = setInterval(() => {
+      processor.sendKeepAlive().catch(() => {});
+    }, 15000);
+  };
+  const stopHeartbeat = () => {
+    if (heartbeatTimer) {
+      clearInterval(heartbeatTimer);
+      heartbeatTimer = null;
+    }
+  };
+  startHeartbeat();
   try {
     while (true) {
       const { done, value } = await reader.read();
@@ -361,10 +382,12 @@ export async function processResponsesSseStream(readableStream, writableStream, 
       }
       if (lineStart > 0) buffer = buffer.slice(lineStart);
     }
+    stopHeartbeat();
     buffer += decoder.decode();
     if (buffer.length > 0) await processor.processLine(buffer.replace(/\r$/, ""));
     return await processor.finish();
   } finally {
+    stopHeartbeat();
     try {
       reader.releaseLock();
     } catch (_) {
