@@ -432,13 +432,6 @@ export class AuditLogStore {
       usage: normalizeTokenUsage(entry.usage)
     };
 
-    let line;
-    try {
-      line = JSON.stringify(record) + "\n";
-    } catch (_) {
-      return;
-    }
-
     if (this.tokenStatsStore && record.status_code === 200) {
       let usage = record.usage;
       if (!usage && typeof record.response_body === "string") usage = extractUsageFromText(record.response_body);
@@ -446,6 +439,13 @@ export class AuditLogStore {
         record.usage = usage;
         this.tokenStatsStore.recordUsage(usage, record.timestamp);
       }
+    }
+
+    let line;
+    try {
+      line = JSON.stringify(record) + "\n";
+    } catch (_) {
+      return;
     }
 
     this.cache = null;
