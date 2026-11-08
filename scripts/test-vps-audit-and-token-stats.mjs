@@ -420,9 +420,21 @@ try {
     const logsJson = await logsRes.json();
     assert.equal(logsJson.success, true);
     assert.equal(logsJson.logs.length, 1);
-    assert.equal(logsJson.logs[0].request_body, '{"a":1}');
+    assert.equal(logsJson.logs[0].request_body, undefined, "the list must not ship bodies");
+    assert.equal(logsJson.logs[0].request_body_bytes, 7, "the list must report body sizes");
+    assert.equal(logsJson.logs[0].has_body, true);
 
-    // A large n must not produce a multi-megabyte reply that freezes the page.
+    const entryRes = await worker.fetch(new Request("https://example.test/api/logs/entry?id=dash_1", { headers: cookie }), env, makeCtx());
+    assert.equal(entryRes.status, 200);
+    const entryJson = await entryRes.json();
+    assert.equal(entryJson.log.request_body, '{"a":1}', "the on-demand endpoint must return the body");
+    assert.equal(entryJson.log.response_body, '{"b":2}');
+    const missingEntry = await worker.fetch(new Request("https://example.test/api/logs/entry?id=nope", { headers: cookie }), env, makeCtx());
+    assert.equal(missingEntry.status, 404);
+    const unauthEntry = await worker.fetch(new Request("https://example.test/api/logs/entry?id=dash_1"), env, makeCtx());
+    assert.equal(unauthEntry.status, 401, "entry endpoint must require a session");
+
+    // A large n must not produce a multi-megabyte list that takes the page out.
     {
       const bulkAudit = new AuditLogStore({ storagePath: path.join(tmpDir, "budget.jsonl") });
       const chunk = "x".repeat(250 * 1024);
@@ -442,13 +454,15 @@ try {
       const bulkEnv = { ...env, auditLogStore: bulkAudit };
       const bigRes = await worker.fetch(new Request("https://example.test/api/logs/recent?n=20", { headers: cookie }), bulkEnv, makeCtx());
       assert.equal(bigRes.status, 200);
-      const bigJson = await bigRes.json();
-      const totalBytes = bigJson.logs.reduce(
-        (sum, item) => sum + (item.request_body?.length || 0) + (item.response_body?.length || 0),
-        0
-      );
-      assert.ok(totalBytes <= 4 * 1024 * 1024, `reply bodies must stay under the 4 MB budget, got ${totalBytes}`);
-      assert.ok(bigJson.omitted > 0, "entries over the budget must be reported, not silently dropped");
+      const listText = await bigRes.text();
+      assert.ok(listText.length < 64 * 1024, `metadata list must stay small, got ${listText.length} bytes`);
+      const bigJson = JSON.parse(listText);
+      assert.ok(bigJson.logs.length >= 8, "the list must still contain the requested entries");
+
+      const oneRes = await worker.fetch(new Request("https://example.test/api/logs/entry?id=budget_19", { headers: cookie }), bulkEnv, makeCtx());
+      assert.equal(oneRes.status, 200);
+      const oneJson = await oneRes.json();
+      assert.ok(oneJson.log.request_body.length <= 260 * 1024, "a single body stays capped");
     }
 
     const statsRes = await worker.fetch(new Request("https://example.test/api/token-stats?days=7", { headers: cookie }), env, makeCtx());

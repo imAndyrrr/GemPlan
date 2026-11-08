@@ -3175,34 +3175,34 @@ async function handleGetRecentLogs(request, env) {
   let n = Number.parseInt(nRaw, 10);
   if (!Number.isFinite(n) || n <= 0) n = 10;
   if (n > 200) n = 200;
-  const logs = env?.auditLogStore ? await env.auditLogStore.getLogs(n, username) : [];
-  // Even with per-body caps, 200 entries can add up to ~100 MB of JSON, which
-  // freezes the browser and hammers the VPS. Keep the reply bounded.
-  const MAX_TOTAL_BODY_BYTES = 4 * 1024 * 1024;
-  const bounded = [];
-  let bodyBytes = 0;
-  let omitted = 0;
-  for (const log of logs) {
-    const size =
-      (typeof log.request_body === "string" ? log.request_body.length : 0) +
-      (typeof log.response_body === "string" ? log.response_body.length : 0);
-    if (bounded.length > 0 && bodyBytes + size > MAX_TOTAL_BODY_BYTES) {
-      omitted += 1;
-      continue;
-    }
-    bounded.push(log);
-    bodyBytes += size;
-  }
+  // Metadata only: bodies are fetched one at a time by /api/logs/entry when the
+  // user expands an entry. Shipping every body at once produced multi-megabyte
+  // replies that took 20+ seconds over the cross-border link.
+  const logs = env?.auditLogStore ? await env.auditLogStore.getLogs(n, username, { includeBodies: false }) : [];
   return jsonResponse({
     success: true,
     n,
-    total: bounded.length,
-    omitted,
-    logs: bounded
+    total: logs.length,
+    omitted: 0,
+    logs
   });
 }
 __name(handleGetRecentLogs, "handleGetRecentLogs");
 __name2(handleGetRecentLogs, "handleGetRecentLogs");
+async function handleGetLogEntry(request, env) {
+  const username = await getSessionUser(request, env);
+  if (!username) return jsonResponse({ error: "Unauthorized" }, 401);
+  if (!env?.auditLogStore && !isVpsEnvironment(env)) {
+    return jsonResponse({ error: "Audit logging is only enabled in VPS mode" }, 403);
+  }
+  const url = new URL(request.url);
+  const id = url.searchParams.get("id") || "";
+  const entry = env?.auditLogStore && id ? await env.auditLogStore.getLogById(id, username) : null;
+  if (!entry) return jsonResponse({ error: "Log entry not found" }, 404);
+  return jsonResponse({ success: true, log: entry });
+}
+__name(handleGetLogEntry, "handleGetLogEntry");
+__name2(handleGetLogEntry, "handleGetLogEntry");
 async function handleClearAuditLogs(request, env) {
   const username = await getSessionUser(request, env);
   if (!username) return jsonResponse({ error: "Unauthorized" }, 401);
@@ -4051,18 +4051,15 @@ async function handleDashboard(request, env) {
                 '</div>' +
                 '<div style="font-size:12px; color:#6c757d; display:flex; align-items:center; gap:8px;">' +
                   '<span>' + (log.duration_ms != null ? log.duration_ms + 'ms' : '') + '</span>' +
+                  (log.has_body ? '<span title="\u8BF7\u6C42\u4F53 / \u54CD\u5E94\u4F53\u5927\u5C0F">' + agAuditSize(log.request_body_bytes) + ' / ' + agAuditSize(log.response_body_bytes) + '</span>' : '') +
                   '<span>' + agEscHtml(log.time_formatted || '') + '</span>' +
                   '<span style="font-size:11px; color:#007bff; text-decoration:underline;">\u5C55\u5F00/\u6298\u53E0</span>' +
                 '</div>';
               
               const bodyEl = document.createElement("div");
               bodyEl.className = "audit-log-body";
-              bodyEl.style.cssText = index === 0 ? "padding: 12px; border-top: 1px solid #e9ecef; background: #fff;" : "display: none; padding: 12px; border-top: 1px solid #e9ecef; background: #fff;";
-              
-              headerEl.onclick = () => {
-                bodyEl.style.display = bodyEl.style.display === "none" ? "block" : "none";
-              };
-              
+              bodyEl.style.cssText = "display: none; padding: 12px; border-top: 1px solid #e9ecef; background: #fff;";
+
               function auditPretty(value) {
                 if (value === null || value === undefined) return "";
                 if (typeof value === "object") {
@@ -4075,30 +4072,57 @@ async function handleDashboard(request, env) {
                 }
                 return text;
               }
-              const reqStr = auditPretty(log.request_body);
-              const respStr = auditPretty(log.response_body);
-              
-              bodyEl.innerHTML = 
-                (log.account ? '<div style="font-size:12px; color:#555; margin-bottom:8px;"><b>\u4F7F\u7528\u8D26\u53F7:</b> ' + agEscHtml(log.account) + '</div>' : '') +
-                (log.error ? '<div style="font-size:12px; color:#dc3545; margin-bottom:8px;"><b>\u9519\u8BEF\u4FE1\u606F:</b> ' + agEscHtml(log.error) + '</div>' : '') +
-                '<div style="margin-bottom:12px;">' +
-                  '<div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:4px;">' +
-                    '<b style="font-size:12px; color:#495057;">\u5B8C\u6574\u8BF7\u6C42\u4F53 (Request Body):</b>' +
-                    '<button class="btn-sm" style="background:#6c757d; color:#fff;" onclick="copyAuditLogText(this, ' + index + ', &quot;req&quot;)">\u590D\u5236\u8BF7\u6C42\u4F53</button>' +
+
+              function renderAuditBody(target, fullLog) {
+                const reqStr = auditPretty(fullLog.request_body);
+                const respStr = auditPretty(fullLog.response_body);
+                target.innerHTML =
+                  (fullLog.account ? '<div style="font-size:12px; color:#555; margin-bottom:8px;"><b>\u4F7F\u7528\u8D26\u53F7:</b> ' + agEscHtml(fullLog.account) + '</div>' : '') +
+                  (fullLog.error ? '<div style="font-size:12px; color:#dc3545; margin-bottom:8px;"><b>\u9519\u8BEF\u4FE1\u606F:</b> ' + agEscHtml(fullLog.error) + '</div>' : '') +
+                  '<div style="margin-bottom:12px;">' +
+                    '<div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:4px;">' +
+                      '<b style="font-size:12px; color:#495057;">\u5B8C\u6574\u8BF7\u6C42\u4F53 (Request Body):</b>' +
+                      '<button class="btn-sm" style="background:#6c757d; color:#fff;" onclick="copyAuditLogText(this, ' + index + ', &quot;req&quot;)">\u590D\u5236\u8BF7\u6C42\u4F53</button>' +
+                    '</div>' +
+                    '<pre class="req-pre-' + index + '" style="max-height:240px; overflow-y:auto; background:#f8f9fa; border:1px solid #ced4da; border-radius:4px; padding:8px; font-size:12px; font-family:monospace; white-space:pre-wrap; word-break:break-all; margin:0;"></pre>' +
                   '</div>' +
-                  '<pre class="req-pre-' + index + '" style="max-height:240px; overflow-y:auto; background:#f8f9fa; border:1px solid #ced4da; border-radius:4px; padding:8px; font-size:12px; font-family:monospace; white-space:pre-wrap; word-break:break-all; margin:0;"></pre>' +
-                '</div>' +
-                '<div>' +
-                  '<div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:4px;">' +
-                    '<b style="font-size:12px; color:#495057;">\u5B8C\u6574\u54CD\u5E94\u4F53 (Response Body):</b>' +
-                    '<button class="btn-sm" style="background:#6c757d; color:#fff;" onclick="copyAuditLogText(this, ' + index + ', &quot;resp&quot;)">\u590D\u5236\u54CD\u5E94\u4F53</button>' +
-                  '</div>' +
-                  '<pre class="resp-pre-' + index + '" style="max-height:240px; overflow-y:auto; background:#f8f9fa; border:1px solid #ced4da; border-radius:4px; padding:8px; font-size:12px; font-family:monospace; white-space:pre-wrap; word-break:break-all; margin:0;"></pre>' +
-                '</div>';
-              
-              bodyEl.querySelector(".req-pre-" + index).textContent = reqStr || "(\u7A7A\u8BF7\u6C42\u4F53)";
-              bodyEl.querySelector(".resp-pre-" + index).textContent = respStr || "(\u7A7A\u54CD\u5E94\u4F53)";
-              
+                  '<div>' +
+                    '<div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:4px;">' +
+                      '<b style="font-size:12px; color:#495057;">\u5B8C\u6574\u54CD\u5E94\u4F53 (Response Body):</b>' +
+                      '<button class="btn-sm" style="background:#6c757d; color:#fff;" onclick="copyAuditLogText(this, ' + index + ', &quot;resp&quot;)">\u590D\u5236\u54CD\u5E94\u4F53</button>' +
+                    '</div>' +
+                    '<pre class="resp-pre-' + index + '" style="max-height:240px; overflow-y:auto; background:#f8f9fa; border:1px solid #ced4da; border-radius:4px; padding:8px; font-size:12px; font-family:monospace; white-space:pre-wrap; word-break:break-all; margin:0;"></pre>' +
+                  '</div>';
+                target.querySelector(".req-pre-" + index).textContent = reqStr || "(\u7A7A\u8BF7\u6C42\u4F53)";
+                target.querySelector(".resp-pre-" + index).textContent = respStr || "(\u7A7A\u54CD\u5E94\u4F53)";
+              }
+
+              // Bodies are fetched only when an entry is expanded: the list stays
+              // small and fast even when each entry carries a 256 KB payload.
+              let bodyLoaded = false;
+              let bodyLoading = false;
+              headerEl.onclick = async () => {
+                if (bodyEl.style.display !== "none") {
+                  bodyEl.style.display = "none";
+                  return;
+                }
+                bodyEl.style.display = "block";
+                if (bodyLoaded || bodyLoading) return;
+                bodyLoading = true;
+                bodyEl.innerHTML = '<div style="font-size:12px; color:#6c757d;">\u6B63\u5728\u52A0\u8F7D\u5B8C\u6574\u8BF7\u6C42\u4F53\u4E0E\u54CD\u5E94\u4F53\u2026</div>';
+                try {
+                  const res = await fetch("/api/logs/entry?id=" + encodeURIComponent(log.id));
+                  const data = await res.json();
+                  if (!res.ok || !data.success) throw new Error(data.error || ("HTTP " + res.status));
+                  renderAuditBody(bodyEl, data.log || {});
+                  bodyLoaded = true;
+                } catch (e) {
+                  bodyEl.innerHTML = '<div style="font-size:12px; color:#dc3545;">\u52A0\u8F7D\u5931\u8D25: ' + agEscHtml(e.message) + '\uFF08\u70B9\u51FB\u53EF\u91CD\u8BD5\uFF09</div>';
+                } finally {
+                  bodyLoading = false;
+                }
+              };
+
               itemEl.appendChild(headerEl);
               itemEl.appendChild(bodyEl);
               container.appendChild(itemEl);
@@ -4150,6 +4174,12 @@ async function handleDashboard(request, env) {
       }
       function fmtTokensFull(n) {
         return Number(n || 0).toLocaleString();
+      }
+      function agAuditSize(bytes) {
+        const n = Number(bytes) || 0;
+        if (n >= 1024 * 1024) return (n / 1024 / 1024).toFixed(1) + "MB";
+        if (n >= 1024) return Math.round(n / 1024) + "KB";
+        return n + "B";
       }
 
       async function fetchTokenStats(days, btnEl) {
@@ -7115,6 +7145,7 @@ var worker_default = {
       if (url.pathname === "/api/user/account") return await handleAccountApi(request, env, ctx);
       if (url.pathname === "/api/antigravity/quota") return await handleAntigravityQuota(request, env, ctx);
       if (url.pathname === "/api/logs/recent") return await handleGetRecentLogs(request, env);
+      if (url.pathname === "/api/logs/entry") return await handleGetLogEntry(request, env);
       if (url.pathname === "/api/logs/clear") return await handleClearAuditLogs(request, env);
       if (url.pathname === "/api/token-stats") return await handleGetTokenStats(request, env);
       const parts = url.pathname.split("/").filter(Boolean);

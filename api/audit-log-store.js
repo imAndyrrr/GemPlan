@@ -470,11 +470,38 @@ export class AuditLogStore {
     return deduped;
   }
 
-  async getLogs(n = 10, username = null) {
+  /**
+   * Newest-first entries. Bodies are omitted by default (`includeBodies:false`)
+   * because a single captured body is up to 256 KB and this gateway often runs
+   * behind a slow cross-border link: shipping ten of them at once turns the
+   * dashboard into a 20+ second spinner. Callers fetch one entry's bodies only
+   * when the user actually expands it.
+   */
+  async getLogs(n = 10, username = null, { includeBodies = true } = {}) {
     const limit = Math.max(1, Math.min(200, Number(n) || 10));
     const entries = await this.readEntries();
     const filtered = username ? entries.filter((item) => !item.username || item.username === username) : entries;
-    return filtered.slice(0, limit);
+    const sliced = filtered.slice(0, limit);
+    if (includeBodies) return sliced;
+    return sliced.map((entry) => {
+      const { request_body, response_body, ...rest } = entry;
+      return {
+        ...rest,
+        request_body_bytes: typeof request_body === "string" ? request_body.length : 0,
+        response_body_bytes: typeof response_body === "string" ? response_body.length : 0,
+        has_body: Boolean(request_body || response_body)
+      };
+    });
+  }
+
+  /** Full record (bodies included) for one id, or null. */
+  async getLogById(id, username = null) {
+    if (!id) return null;
+    const entries = await this.readEntries();
+    const entry = entries.find((item) => item.id === id);
+    if (!entry) return null;
+    if (username && entry.username && entry.username !== username) return null;
+    return entry;
   }
 
   async clearLogs(username = null) {
