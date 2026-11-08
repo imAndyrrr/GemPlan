@@ -237,6 +237,14 @@ try {
   assert.ok(dashHtml.includes("fetchRecentAuditLogs"), "Dashboard in VPS mode must have fetchRecentAuditLogs script");
   assert.ok(dashHtml.includes("renderTokenBarChart"), "Dashboard in VPS mode must have renderTokenBarChart script");
 
+  // Verify that the injected script has zero syntax errors
+  const scriptMatch = dashHtml.match(/<script>([\s\S]*?)<\/script>/i);
+  assert.ok(scriptMatch, "Dashboard HTML must contain a script block");
+  const vm = await import("node:vm");
+  assert.doesNotThrow(() => {
+    new vm.Script(scriptMatch[1]);
+  }, "Dashboard embedded JavaScript must compile with zero syntax errors");
+
   // 4e. Dashboard HTML in non-VPS mode (Cloudflare Worker) omits Card 5 and Card 6
   const cfEnv = { GEMINI_KV: kv, IS_VPS: "false" };
   const cfDashRes = await worker.fetch(dashReq, cfEnv, dummyCtx);

@@ -4058,14 +4058,14 @@ async function handleDashboard(request, env) {
                 '<div style="margin-bottom:12px;">' +
                   '<div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:4px;">' +
                     '<b style="font-size:12px; color:#495057;">\u5B8C\u6574\u8BF7\u6C42\u4F53 (Request Body):</b>' +
-                    '<button class="btn-sm" style="background:#6c757d; color:#fff;" onclick="copyAuditLogText(this, ' + index + ', \'req\')">\u590D\u5236\u8BF7\u6C42\u4F53</button>' +
+                    '<button class="btn-sm" style="background:#6c757d; color:#fff;" onclick="copyAuditLogText(this, ' + index + ', &quot;req&quot;)">\u590D\u5236\u8BF7\u6C42\u4F53</button>' +
                   '</div>' +
                   '<pre class="req-pre-' + index + '" style="max-height:240px; overflow-y:auto; background:#f8f9fa; border:1px solid #ced4da; border-radius:4px; padding:8px; font-size:12px; font-family:monospace; white-space:pre-wrap; word-break:break-all; margin:0;"></pre>' +
                 '</div>' +
                 '<div>' +
                   '<div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:4px;">' +
                     '<b style="font-size:12px; color:#495057;">\u5B8C\u6574\u54CD\u5E94\u4F53 (Response Body):</b>' +
-                    '<button class="btn-sm" style="background:#6c757d; color:#fff;" onclick="copyAuditLogText(this, ' + index + ', \'resp\')">\u590D\u5236\u54CD\u5E94\u4F53</button>' +
+                    '<button class="btn-sm" style="background:#6c757d; color:#fff;" onclick="copyAuditLogText(this, ' + index + ', &quot;resp&quot;)">\u590D\u5236\u54CD\u5E94\u4F53</button>' +
                   '</div>' +
                   '<pre class="resp-pre-' + index + '" style="max-height:240px; overflow-y:auto; background:#f8f9fa; border:1px solid #ced4da; border-radius:4px; padding:8px; font-size:12px; font-family:monospace; white-space:pre-wrap; word-break:break-all; margin:0;"></pre>' +
                 '</div>';
