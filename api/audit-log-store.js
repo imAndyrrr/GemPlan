@@ -373,13 +373,31 @@ export class AuditLogStore {
   async maybeRotate() {
     if (this.rotatePending) return;
     this.rotatePending = true;
+    const rotateLock = `${this.storagePath}.rotate.lock`;
     try {
       const stat = await fsp.stat(this.storagePath).catch(() => null);
       if (stat && stat.size > MAX_FILE_BYTES) {
-        await fsp.rm(this.backupPath, { force: true }).catch(() => {});
-        await fsp.rename(this.storagePath, this.backupPath).catch(() => {});
-        this.cache = null;
-        this.cacheAt = 0;
+        // Take a non-blocking lock so multiple cluster workers don't race
+        // to rename/rm at the same time.
+        let handle = null;
+        try {
+          handle = await fsp.open(rotateLock, "wx");
+        } catch (err) {
+          if (err?.code === "EEXIST") return; // another worker is already rotating
+          throw err;
+        }
+        try {
+          const recheck = await fsp.stat(this.storagePath).catch(() => null);
+          if (recheck && recheck.size > MAX_FILE_BYTES) {
+            await fsp.rm(this.backupPath, { force: true }).catch(() => {});
+            await fsp.rename(this.storagePath, this.backupPath).catch(() => {});
+            this.cache = null;
+            this.cacheAt = 0;
+          }
+        } finally {
+          if (handle) await handle.close().catch(() => {});
+          await fsp.rm(rotateLock, { force: true }).catch(() => {});
+        }
       }
     } catch (_) {
     } finally {
@@ -498,13 +516,37 @@ export class AuditLogStore {
   async getLogById(id, username = null) {
     if (!id) return null;
     const entries = await this.readEntries();
-    const entry = entries.find((item) => item.id === id);
+    let entry = entries.find((item) => item.id === id);
+    if (!entry) {
+      // If not in the cached 6 MB tail, do a fallback linear search backwards in the current file
+      try {
+        const raw = await fsp.readFile(this.storagePath, "utf8");
+        const lines = raw.split("\n");
+        for (let i = lines.length - 1; i >= 0; i--) {
+          const line = lines[i];
+          if (line && line.includes(id)) {
+            try {
+              const parsed = JSON.parse(line);
+              if (parsed.id === id) {
+                entry = parsed;
+                break;
+              }
+            } catch (_) {}
+          }
+        }
+      } catch (_) {}
+    }
     if (!entry) return null;
     if (username && entry.username && entry.username !== username) return null;
     return entry;
   }
 
   async clearLogs(username = null) {
+    const clearLock = `${this.storagePath}.clear.lock`;
+    let handle = null;
+    try {
+      handle = await fsp.open(clearLock, "w");
+    } catch (_) {}
     if (username) {
       const entries = await this.readEntries();
       const kept = entries.filter((item) => item.username && item.username !== username);
@@ -513,9 +555,14 @@ export class AuditLogStore {
     } else {
       await this.appendChain.catch(() => {});
       await fsp.writeFile(this.storagePath, "", "utf8");
+      await fsp.rm(this.backupPath, { force: true }).catch(() => {});
     }
     this.cache = null;
     this.cacheAt = 0;
+    if (handle) {
+      await handle.close().catch(() => {});
+      await fsp.rm(clearLock, { force: true }).catch(() => {});
+    }
   }
 }
 
