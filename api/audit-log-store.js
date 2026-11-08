@@ -98,86 +98,198 @@ function emptyDay(date) {
 // ---------------------------------------------------------------------------
 // Daily token statistics: one compact record per calendar day. Writes are
 // debounced and asynchronous so the request path never waits on disk.
+//
+// The VPS runs the gateway as a Node cluster (one process per CPU), so this
+// store MUST be safe across processes. An earlier revision kept a private
+// in-memory map per worker and rewrote the whole file with it, which meant the
+// two workers clobbered each other and /api/token-stats returned different
+// numbers depending on which worker answered. The rules now are:
+//   * each worker only owns a small "delta" of usage it has not written yet;
+//   * a persist takes a lock, re-reads the file, merges the delta, and renames
+//     a temporary file over it (so readers never see a half-written file);
+//   * reads always come from the shared file (short cache), never from a
+//     private map that may be missing the other worker's traffic.
 // ---------------------------------------------------------------------------
+const STATS_LOCK_TIMEOUT_MS = 5000;
+const STATS_LOCK_STALE_MS = 15000;
+
+function addUsage(target, key, normalized, count = 1) {
+  const row = target[key] || (target[key] = emptyDay(key));
+  row.prompt_tokens += normalized.prompt_tokens;
+  row.output_tokens += normalized.output_tokens;
+  row.reasoning_tokens += normalized.reasoning_tokens;
+  row.cached_tokens += normalized.cached_tokens;
+  row.total_tokens += normalized.total_tokens;
+  row.request_count += count;
+  return row;
+}
+
+function mergeDay(target, key, row) {
+  const dest = target[key] || (target[key] = emptyDay(key));
+  dest.prompt_tokens += Number(row.prompt_tokens) || 0;
+  dest.output_tokens += Number(row.output_tokens) || 0;
+  dest.reasoning_tokens += Number(row.reasoning_tokens) || 0;
+  dest.cached_tokens += Number(row.cached_tokens) || 0;
+  dest.total_tokens += Number(row.total_tokens) || 0;
+  dest.request_count += Number(row.request_count) || 0;
+  return dest;
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 export class TokenStatsStore {
   constructor(options = {}) {
     this.storagePath = options.storagePath || path.resolve(process.cwd(), "data/daily-token-stats.json");
+    this.lockPath = `${this.storagePath}.lock`;
     this.dailyMap = {};
+    this.pending = {};
     this.loaded = false;
     this.loadPromise = null;
     this.writeTimer = null;
     this.writing = null;
-    this.dirty = false;
+    this.persistAgain = false;
+    this.retryDelay = 1000;
+    this.failedOnce = false;
   }
 
   async ready() {
     if (this.loaded) return;
     if (!this.loadPromise) {
       this.loadPromise = (async () => {
-        try {
-          const raw = await fsp.readFile(this.storagePath, "utf8");
-          const parsed = JSON.parse(raw);
-          if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-            this.dailyMap = parsed;
-          }
-        } catch (_) {}
+        const disk = await this.readFile();
+        if (disk) this.dailyMap = disk;
         this.loaded = true;
       })();
     }
     await this.loadPromise;
   }
 
+  /** Read the shared file. Returns null when it is missing or corrupt. */
+  async readFile() {
+    try {
+      const raw = await fsp.readFile(this.storagePath, "utf8");
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) return parsed;
+    } catch (_) {}
+    return null;
+  }
+
+  /** Cross-process exclusive lock; stale locks left by a crash expire. */
+  async withLock(fn) {
+    const startedAt = Date.now();
+    let handle = null;
+    for (;;) {
+      try {
+        handle = await fsp.open(this.lockPath, "wx");
+        break;
+      } catch (err) {
+        if (err?.code !== "EEXIST") throw err;
+        const stat = await fsp.stat(this.lockPath).catch(() => null);
+        if (stat && Date.now() - stat.mtimeMs > STATS_LOCK_STALE_MS) {
+          await fsp.rm(this.lockPath, { force: true }).catch(() => {});
+          continue;
+        }
+        if (Date.now() - startedAt > STATS_LOCK_TIMEOUT_MS) {
+          throw new Error("token stats lock timeout");
+        }
+        await sleep(10 + Math.random() * 20);
+      }
+    }
+    try {
+      return await fn();
+    } finally {
+      if (handle) await handle.close().catch(() => {});
+      await fsp.rm(this.lockPath, { force: true }).catch(() => {});
+    }
+  }
+
   recordUsage(usage, timestamp = Date.now(), model = null, username = null) {
     const normalized = normalizeTokenUsage(usage);
     if (!normalized) return;
     const key = dayKey(timestamp);
-    const row = this.dailyMap[key] || (this.dailyMap[key] = emptyDay(key));
-    row.prompt_tokens += normalized.prompt_tokens;
-    row.output_tokens += normalized.output_tokens;
-    row.reasoning_tokens += normalized.reasoning_tokens;
-    row.cached_tokens += normalized.cached_tokens;
-    row.total_tokens += normalized.total_tokens;
-    row.request_count += 1;
+    addUsage(this.dailyMap, key, normalized);
+    addUsage(this.pending, key, normalized);
     this.schedulePersist();
   }
 
-  schedulePersist() {
-    this.dirty = true;
+  schedulePersist(delay = 1000) {
     if (this.writeTimer) return;
     this.writeTimer = setTimeout(() => {
       this.writeTimer = null;
       void this.persist();
-    }, 1000);
+    }, delay);
     if (typeof this.writeTimer.unref === "function") this.writeTimer.unref();
   }
 
   async persist() {
-    if (!this.dirty) return;
     if (this.writing) {
-      this.schedulePersist();
-      return;
+      this.persistAgain = true;
+      return this.writing;
     }
-    this.dirty = false;
-    const payload = JSON.stringify(this.dailyMap);
+    const delta = this.pending;
+    if (!Object.keys(delta).length) return;
+    this.pending = {};
     this.writing = (async () => {
       try {
-        await fsp.mkdir(path.dirname(this.storagePath), { recursive: true });
-        const tmp = `${this.storagePath}.${process.pid}.${Date.now()}.tmp`;
-        await fsp.writeFile(tmp, payload, "utf8");
-        await fsp.rename(tmp, this.storagePath);
+        await this.withLock(async () => {
+          const disk = (await this.readFile()) || {};
+          for (const [key, row] of Object.entries(delta)) mergeDay(disk, key, row);
+          await this.writeAtomic(disk);
+          this.dailyMap = disk;
+        });
+        this.retryDelay = 1000;
+        this.failedOnce = false;
       } catch (err) {
+        // Never lose recorded usage: put the delta back for the next attempt.
+        for (const [key, row] of Object.entries(delta)) mergeDay(this.pending, key, row);
         console.warn("[TokenStatsStore] persist failed:", err?.message || err);
+        // Retry once shortly; after that, wait for the next recorded request so
+        // a permanently broken data directory cannot spin in the background.
+        if (!this.failedOnce) {
+          this.failedOnce = true;
+          this.schedulePersist(Math.min(this.retryDelay, 5000));
+        }
       }
     })();
     try {
       await this.writing;
     } finally {
       this.writing = null;
+      if (this.persistAgain) {
+        this.persistAgain = false;
+        this.schedulePersist(50);
+      }
     }
   }
 
+  async writeAtomic(map) {
+    await fsp.mkdir(path.dirname(this.storagePath), { recursive: true });
+    const tmp = `${this.storagePath}.${process.pid}.${Date.now()}.tmp`;
+    await fsp.writeFile(tmp, JSON.stringify(map), "utf8");
+    await fsp.rename(tmp, this.storagePath);
+  }
+
+  /**
+   * Shared, cross-worker view of the daily map. The file holds a single
+   * compact record per day, so reading it is trivially cheap; always reading
+   * means the dashboard can never show another worker's stale snapshot.
+   */
+  async snapshot() {
+    let disk = await this.readFile();
+    if (!disk) disk = this.dailyMap;
+    if (this.writing || !Object.keys(this.pending).length) return disk;
+    // Include this worker's not-yet-flushed usage. (While a flush is in flight
+    // the delta is already part of whichever file version we just read, so it
+    // is skipped above to avoid double counting.)
+    const view = { ...disk };
+    for (const [key, row] of Object.entries(this.pending)) mergeDay(view, key, row);
+    return view;
+  }
+
   async getStats({ days = 7, startDate = null, endDate = null } = {}) {
-    await this.ready();
+    const map = await this.snapshot();
     let start;
     let end;
     if (startDate && endDate) {
@@ -204,7 +316,7 @@ export class TokenStatsStore {
     let guard = 0;
     while (cursor <= end && guard++ < 400) {
       const key = dayKey(cursor.getTime());
-      const row = this.dailyMap[key] || emptyDay(key);
+      const row = map[key] || emptyDay(key);
       daily.push(row);
       summary.prompt_tokens += row.prompt_tokens;
       summary.output_tokens += row.output_tokens;
@@ -219,8 +331,10 @@ export class TokenStatsStore {
 
   async clearStats() {
     this.dailyMap = {};
-    this.dirty = true;
-    await this.persist();
+    this.pending = {};
+    await this.withLock(async () => {
+      await this.writeAtomic({});
+    });
   }
 }
 

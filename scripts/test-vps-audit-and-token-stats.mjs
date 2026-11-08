@@ -199,6 +199,42 @@ try {
   assert.equal(statsWithRange.daily.length, 3, "custom date range must be inclusive");
   console.log("PASS: daily token stats aggregation, persistence, and range queries");
 
+  // Two cluster workers share one file. Neither may clobber the other, and both
+  // must answer /api/token-stats with the same totals.
+  const sharedStatsPath = path.join(tmpDir, "daily-token-stats-cluster.json");
+  const workerA = new TokenStatsStore({ storagePath: sharedStatsPath });
+  const workerB = new TokenStatsStore({ storagePath: sharedStatsPath });
+  await workerA.ready();
+  await workerB.ready();
+  workerA.recordUsage({ prompt_tokens: 100, output_tokens: 10, total_tokens: 110 }, nowMs);
+  await workerA.persist();
+  workerB.recordUsage({ prompt_tokens: 200, output_tokens: 20, total_tokens: 220 }, nowMs);
+  await workerB.persist();
+  workerA.recordUsage({ prompt_tokens: 7, output_tokens: 3, total_tokens: 10 }, nowMs);
+  await workerA.persist();
+
+  const viewA = await workerA.getStats({ days: 1 });
+  const viewB = await workerB.getStats({ days: 1 });
+  for (const view of [viewA, viewB]) {
+    assert.equal(view.summary.request_count, 3, "both workers must see every worker's usage");
+    assert.equal(view.summary.prompt_tokens, 307, "prompt tokens must be merged, not overwritten");
+    assert.equal(view.summary.output_tokens, 33, "output tokens must be merged, not overwritten");
+  }
+  const onDisk = JSON.parse(fs.readFileSync(sharedStatsPath, "utf8"));
+  const today = new Date(nowMs);
+  const todayKey = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, "0")}-${String(today.getDate()).padStart(2, "0")}`;
+  assert.equal(onDisk[todayKey].request_count, 3, "the shared file must hold the merged totals");
+
+  // A worker that has not flushed yet must still see its own usage.
+  const workerC = new TokenStatsStore({ storagePath: sharedStatsPath });
+  workerC.recordUsage({ prompt_tokens: 5, output_tokens: 5, total_tokens: 10 }, nowMs);
+  const unflushedView = await workerC.getStats({ days: 1 });
+  assert.equal(unflushedView.summary.request_count, 4, "unflushed usage must be visible locally");
+  await workerC.persist();
+  const afterFlush = await workerA.getStats({ days: 1 });
+  assert.equal(afterFlush.summary.request_count, 4, "flushed usage must be visible to the other worker");
+  console.log("PASS: token stats stay consistent across cluster workers");
+
   // ---------------------------------------------------------- audit store ---
   const auditStore = new AuditLogStore({ storagePath: auditPath, tokenStatsStore: reloaded });
   await auditStore.addLog({
@@ -386,6 +422,35 @@ try {
     assert.equal(logsJson.logs.length, 1);
     assert.equal(logsJson.logs[0].request_body, '{"a":1}');
 
+    // A large n must not produce a multi-megabyte reply that freezes the page.
+    {
+      const bulkAudit = new AuditLogStore({ storagePath: path.join(tmpDir, "budget.jsonl") });
+      const chunk = "x".repeat(250 * 1024);
+      for (let i = 0; i < 20; i += 1) {
+        bulkAudit.enqueueAppend(
+          JSON.stringify({
+            id: `budget_${i}`,
+            timestamp: Date.now() + i,
+            status_code: 200,
+            username: "admin",
+            request_body: chunk,
+            response_body: chunk
+          }) + "\n"
+        );
+      }
+      await bulkAudit.appendChain;
+      const bulkEnv = { ...env, auditLogStore: bulkAudit };
+      const bigRes = await worker.fetch(new Request("https://example.test/api/logs/recent?n=20", { headers: cookie }), bulkEnv, makeCtx());
+      assert.equal(bigRes.status, 200);
+      const bigJson = await bigRes.json();
+      const totalBytes = bigJson.logs.reduce(
+        (sum, item) => sum + (item.request_body?.length || 0) + (item.response_body?.length || 0),
+        0
+      );
+      assert.ok(totalBytes <= 4 * 1024 * 1024, `reply bodies must stay under the 4 MB budget, got ${totalBytes}`);
+      assert.ok(bigJson.omitted > 0, "entries over the budget must be reported, not silently dropped");
+    }
+
     const statsRes = await worker.fetch(new Request("https://example.test/api/token-stats?days=7", { headers: cookie }), env, makeCtx());
     assert.equal(statsRes.status, 200);
     const statsJson = await statsRes.json();
@@ -418,6 +483,8 @@ try {
   console.log("\nALL VPS AUDIT & TOKEN STATS TESTS PASSED!");
 } finally {
   globalThis.fetch = originalFetch;
+  // Let debounced token-stat writes finish before the temp directory vanishes.
+  await new Promise((resolve) => setTimeout(resolve, 1300));
   try {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   } catch {}

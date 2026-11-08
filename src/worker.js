@@ -3176,11 +3176,29 @@ async function handleGetRecentLogs(request, env) {
   if (!Number.isFinite(n) || n <= 0) n = 10;
   if (n > 200) n = 200;
   const logs = env?.auditLogStore ? await env.auditLogStore.getLogs(n, username) : [];
+  // Even with per-body caps, 200 entries can add up to ~100 MB of JSON, which
+  // freezes the browser and hammers the VPS. Keep the reply bounded.
+  const MAX_TOTAL_BODY_BYTES = 4 * 1024 * 1024;
+  const bounded = [];
+  let bodyBytes = 0;
+  let omitted = 0;
+  for (const log of logs) {
+    const size =
+      (typeof log.request_body === "string" ? log.request_body.length : 0) +
+      (typeof log.response_body === "string" ? log.response_body.length : 0);
+    if (bounded.length > 0 && bodyBytes + size > MAX_TOTAL_BODY_BYTES) {
+      omitted += 1;
+      continue;
+    }
+    bounded.push(log);
+    bodyBytes += size;
+  }
   return jsonResponse({
     success: true,
     n,
-    total: logs.length,
-    logs
+    total: bounded.length,
+    omitted,
+    logs: bounded
   });
 }
 __name(handleGetRecentLogs, "handleGetRecentLogs");
@@ -4003,7 +4021,8 @@ async function handleDashboard(request, env) {
             throw new Error(data.error || ("HTTP " + res.status));
           }
           const logs = data.logs || [];
-          if (statusEl) statusEl.textContent = "\u5DF2\u83B7\u53D6\u6700\u8FD1 " + logs.length + " \u6761\u8BB0\u5F55 (n = " + n + "):";
+          const omittedNote = data.omitted ? "\uFF0C\u53E6\u6709 " + data.omitted + " \u6761\u56E0\u5355\u6B21\u8FD4\u56DE\u4F53\u79EF\u4E0A\u9650\u672A\u663E\u793A\uFF08\u8BF7\u51CF\u5C0F n\uFF09" : "";
+          if (statusEl) statusEl.textContent = "\u5DF2\u83B7\u53D6\u6700\u8FD1 " + logs.length + " \u6761\u8BB0\u5F55 (n = " + n + ")" + omittedNote + ":";
           if (container) {
             container.style.display = "block";
             if (logs.length === 0) {
