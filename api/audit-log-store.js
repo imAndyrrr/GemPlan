@@ -47,12 +47,13 @@ export function normalizeTokenUsage(meta) {
   if (!meta || typeof meta !== "object") return null;
   const prompt_tokens = Number(meta.promptTokenCount || meta.prompt_tokens || meta.input_tokens || 0);
   const output_tokens = Number(meta.candidatesTokenCount || meta.output_tokens || meta.completion_tokens || 0);
-  const reasoning_tokens = Number(meta.thoughtsTokenCount || meta.reasoning_tokens || 0);
+  const reasoning_tokens = Number(meta.thoughtsTokenCount || meta.reasoning_tokens || meta.output_tokens_details?.reasoning_tokens || 0);
   const cached_tokens = Number(
     meta.cachedContentTokenCount ||
       meta.cached_tokens ||
       meta.cache_read_input_tokens ||
       meta.prompt_tokens_details?.cached_tokens ||
+      meta.input_tokens_details?.cached_tokens ||
       0
   );
   const total_tokens = Number(meta.totalTokenCount || meta.total_tokens || (prompt_tokens + output_tokens + reasoning_tokens));
@@ -63,17 +64,21 @@ export function normalizeTokenUsage(meta) {
 /** Best-effort usage extraction from a raw SSE transcript. */
 export function extractUsageFromText(text) {
   if (!text || typeof text !== "string") return null;
-  const patterns = [/"usageMetadata"\s*:\s*(\{[^{}]*\})/g, /"usage"\s*:\s*(\{[^{}]*\})/g];
-  for (const re of patterns) {
-    let match;
-    let last = null;
-    while ((match = re.exec(text)) !== null) last = match[1];
-    if (last) {
-      try {
-        const parsed = normalizeTokenUsage(JSON.parse(last));
-        if (parsed) return parsed;
-      } catch (_) {}
-    }
+  // Walk through SSE data lines from end to start to find the final chunk with usage
+  const lines = text.split("\n");
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i].trim();
+    if (!line.startsWith("data:") || line === "data: [DONE]") continue;
+    const dataStr = line.slice(5).trim();
+    if (!dataStr.startsWith("{")) continue;
+    try {
+      const obj = JSON.parse(dataStr);
+      const rawUsage = obj?.usage || obj?.response?.usage || obj?.usageMetadata || obj?.response?.usageMetadata;
+      if (rawUsage) {
+        const normalized = normalizeTokenUsage(rawUsage);
+        if (normalized) return normalized;
+      }
+    } catch (_) {}
   }
   return null;
 }
@@ -437,7 +442,10 @@ export class AuditLogStore {
     if (this.tokenStatsStore && record.status_code === 200) {
       let usage = record.usage;
       if (!usage && typeof record.response_body === "string") usage = extractUsageFromText(record.response_body);
-      if (usage) this.tokenStatsStore.recordUsage(usage, record.timestamp);
+      if (usage) {
+        record.usage = usage;
+        this.tokenStatsStore.recordUsage(usage, record.timestamp);
+      }
     }
 
     this.cache = null;
