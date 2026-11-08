@@ -3483,7 +3483,7 @@ async function handleDashboard(request, env) {
 
       <div id="token-summary-grid" style="display:grid; grid-template-columns:repeat(auto-fit, minmax(105px, 1fr)); gap:8px; margin-bottom:15px;">
         <div style="background:#f8f9fa; border:1px solid #dee2e6; border-radius:6px; padding:8px 10px; text-align:center;">
-          <div style="font-size:11px; color:#6c757d;">\u8BFB\u53D6 / \u8F93\u5165</div>
+          <div style="font-size:11px; color:#6c757d;">\u8BFB\u53D6 (\u672A\u7F13\u5B58)</div>
           <div id="token-sum-prompt" style="font-size:15px; font-weight:bold; color:#007bff; margin-top:2px;">0</div>
         </div>
         <div style="background:#f8f9fa; border:1px solid #dee2e6; border-radius:6px; padding:8px 10px; text-align:center;">
@@ -3509,7 +3509,7 @@ async function handleDashboard(request, env) {
       </div>
 
       <div style="display:flex; justify-content:center; gap:14px; font-size:11px; color:#555; margin-bottom:8px; flex-wrap:wrap;">
-        <span style="display:inline-flex; align-items:center; gap:4px;"><span style="display:inline-block; width:10px; height:10px; background:#007bff; border-radius:2px;"></span>\u672A\u7F13\u5B58\u8BFB\u53D6 (\u8F93\u5165-\u7F13\u5B58)</span>
+        <span style="display:inline-flex; align-items:center; gap:4px;"><span style="display:inline-block; width:10px; height:10px; background:#007bff; border-radius:2px;"></span>\u8BFB\u53D6 (\u603B\u8BFB\u53D6-\u7F13\u5B58)</span>
         <span style="display:inline-flex; align-items:center; gap:4px;"><span style="display:inline-block; width:10px; height:10px; background:#17a2b8; border-radius:2px;"></span>\u7F13\u5B58\u547D\u4E2D Cached</span>
         <span style="display:inline-flex; align-items:center; gap:4px;"><span style="display:inline-block; width:10px; height:10px; background:#28a745; border-radius:2px;"></span>\u6A21\u578B\u8F93\u51FA Output</span>
         <span style="display:inline-flex; align-items:center; gap:4px;"><span style="display:inline-block; width:10px; height:10px; background:#fd7e14; border-radius:2px;"></span>\u601D\u8003 Reasoning</span>
@@ -4259,7 +4259,12 @@ async function handleDashboard(request, env) {
         const daily = data.daily || [];
 
         const promptEl = document.getElementById("token-sum-prompt");
-        if (promptEl) promptEl.textContent = fmtTokens(sum.prompt_tokens);
+        // Display un-cached prompt (total prompt - cached) so the blue card matches the blue bar
+        const uncacheSum = Math.max(0, (sum.prompt_tokens || 0) - (sum.cached_tokens || 0));
+        if (promptEl) {
+          promptEl.textContent = fmtTokens(uncacheSum);
+          promptEl.title = "\u672A\u7F13\u5B58\u8BFB\u53D6: " + fmtTokensFull(uncacheSum) + " (\u603B\u8BFB\u53D6: " + fmtTokensFull(sum.prompt_tokens) + ")";
+        }
         const cachedEl = document.getElementById("token-sum-cached");
         if (cachedEl) cachedEl.textContent = fmtTokens(sum.cached_tokens);
         const outEl = document.getElementById("token-sum-output");
@@ -4356,7 +4361,7 @@ async function handleDashboard(request, env) {
         const d = daily[idx];
         detailEl.style.display = "block";
         const uncacheVal = Math.max(0, (d.prompt_tokens || 0) - (d.cached_tokens || 0));
-        detailEl.innerHTML = '<b>' + agEscHtml(d.date) + '</b> \u00B7 \u603B Token: <b>' + fmtTokensFull(d.total_tokens) + '</b> (\u603B\u8BFB\u53D6: <span style="color:#007bff;font-weight:bold;">' + fmtTokensFull(d.prompt_tokens) + '</span> [\u672A\u7F13\u5B58: ' + fmtTokensFull(uncacheVal) + '] \u00B7 \u7F13\u5B58: <span style="color:#17a2b8;font-weight:bold;">' + fmtTokensFull(d.cached_tokens) + '</span> \u00B7 \u8F93\u51FA: <span style="color:#28a745;font-weight:bold;">' + fmtTokensFull(d.output_tokens) + '</span> \u00B7 \u601D\u8003: <span style="color:#fd7e14;font-weight:bold;">' + fmtTokensFull(d.reasoning_tokens) + '</span>) \u00B7 \u8BF7\u6C42\u6B21\u6570: <b>' + d.request_count + '</b> \u6B21';
+        detailEl.innerHTML = '<b>' + agEscHtml(d.date) + '</b> \u00B7 \u603B Token: <b>' + fmtTokensFull(d.total_tokens) + '</b> (\u8BFB\u53D6[\u672A\u7F13\u5B58]: <span style="color:#007bff;font-weight:bold;">' + fmtTokensFull(uncacheVal) + '</span> [\u603B\u8F93\u5165: ' + fmtTokensFull(d.prompt_tokens) + '] \u00B7 \u7F13\u5B58: <span style="color:#17a2b8;font-weight:bold;">' + fmtTokensFull(d.cached_tokens) + '</span> \u00B7 \u8F93\u51FA: <span style="color:#28a745;font-weight:bold;">' + fmtTokensFull(d.output_tokens) + '</span> \u00B7 \u601D\u8003: <span style="color:#fd7e14;font-weight:bold;">' + fmtTokensFull(d.reasoning_tokens) + '</span>) \u00B7 \u8BF7\u6C42\u6B21\u6570: <b>' + d.request_count + '</b> \u6B21';
       }
 
       if (${isVps ? "true" : "false"}) {
