@@ -3213,7 +3213,9 @@ async function handleGetTokenStats(request, env) {
   if (days > 365) days = 365;
 
   const store = env?.tokenStatsStore || env?.auditLogStore?.tokenStatsStore;
-  const stats = store ? store.getStats({ days, startDate, endDate, username }) : { daily: [], summary: {} };
+  const stats = store
+    ? await store.getStats({ days, startDate, endDate, username })
+    : { daily: [], summary: {} };
   return jsonResponse({
     success: true,
     ...stats
@@ -4042,15 +4044,20 @@ async function handleDashboard(request, env) {
                 bodyEl.style.display = bodyEl.style.display === "none" ? "block" : "none";
               };
               
-              let reqStr = "";
-              try {
-                reqStr = typeof log.request_body === "object" ? JSON.stringify(log.request_body, null, 2) : String(log.request_body || "");
-              } catch (_) { reqStr = String(log.request_body || ""); }
-              
-              let respStr = "";
-              try {
-                respStr = typeof log.response_body === "object" ? JSON.stringify(log.response_body, null, 2) : String(log.response_body || "");
-              } catch (_) { respStr = String(log.response_body || ""); }
+              function auditPretty(value) {
+                if (value === null || value === undefined) return "";
+                if (typeof value === "object") {
+                  try { return JSON.stringify(value, null, 2); } catch (_) { return String(value); }
+                }
+                const text = String(value);
+                const trimmed = text.trim();
+                if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+                  try { return JSON.stringify(JSON.parse(trimmed), null, 2); } catch (_) { return text; }
+                }
+                return text;
+              }
+              const reqStr = auditPretty(log.request_body);
+              const respStr = auditPretty(log.response_body);
               
               bodyEl.innerHTML = 
                 (log.account ? '<div style="font-size:12px; color:#555; margin-bottom:8px;"><b>\u4F7F\u7528\u8D26\u53F7:</b> ' + agEscHtml(log.account) + '</div>' : '') +
@@ -5758,11 +5765,8 @@ async function handleApiProxy(request, env, ctx, customPath, apiType) {
     auditEntry.duration_ms = Date.now() - auditStartTime;
     auditEntry.error = typeof errorPayload === "string" ? errorPayload : (errorPayload?.error?.message || errorPayload?.error || JSON.stringify(errorPayload));
     auditEntry.response_body = errorPayload;
-    if (ctx?.waitUntil) {
-      ctx.waitUntil(Promise.resolve(env.auditLogStore.addLog(auditEntry)).catch(() => {}));
-    } else {
-      Promise.resolve(env.auditLogStore.addLog(auditEntry)).catch(() => {});
-    }
+    // Fire-and-forget: an audit write must never delay the client response.
+    Promise.resolve(env.auditLogStore.addLog(auditEntry)).catch(() => {});
   };
 
   const recordAuditSuccess = (resBody, usage = null) => {
@@ -5771,11 +5775,8 @@ async function handleApiProxy(request, env, ctx, customPath, apiType) {
     auditEntry.duration_ms = Date.now() - auditStartTime;
     auditEntry.response_body = resBody;
     if (usage) auditEntry.usage = usage;
-    if (ctx?.waitUntil) {
-      ctx.waitUntil(Promise.resolve(env.auditLogStore.addLog(auditEntry)).catch(() => {}));
-    } else {
-      Promise.resolve(env.auditLogStore.addLog(auditEntry)).catch(() => {});
-    }
+    // Fire-and-forget: an audit write must never delay the client response.
+    Promise.resolve(env.auditLogStore.addLog(auditEntry)).catch(() => {});
   };
 
   const responseProtocol = apiType === "openai-responses";
@@ -5811,13 +5812,17 @@ async function handleApiProxy(request, env, ctx, customPath, apiType) {
   };
   let body;
   try {
-    body = await request.json();
+    // Read the raw text once, then parse. This lets the audit trail keep the
+    // original payload verbatim without a second deep clone (a deep clone of a
+    // multi-megabyte history is pure hot-path memory pressure), and lets us
+    // cap what we store.
+    const rawBodyText = await request.text();
+    body = JSON.parse(rawBodyText);
     if (auditEntry) {
-      try {
-        auditEntry.request_body = structuredClone(body);
-      } catch (_) {
-        auditEntry.request_body = body;
-      }
+      auditEntry.request_body =
+        rawBodyText.length > 256 * 1024
+          ? rawBodyText.slice(0, 256 * 1024) + "\n\n…[TRUNCATED: request exceeded 256 KB capture limit]"
+          : rawBodyText;
     }
   } catch (e) {
     recordAuditError(400, { error: "Invalid JSON payload" });
@@ -6813,33 +6818,65 @@ async function handleApiProxy(request, env, ctx, customPath, apiType) {
     }
     let returnReadable = readable;
     if (auditEntry && env?.auditLogStore) {
-      const [clientStream, auditStream] = readable.tee();
-      returnReadable = clientStream;
-      const captureStream = async () => {
-        try {
-          const reader = auditStream.getReader();
-          const decoder = new TextDecoder();
-          let accumulated = "";
-          while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            if (value) accumulated += decoder.decode(value, { stream: true });
-          }
-          accumulated += decoder.decode();
-          auditEntry.status_code = 200;
-          auditEntry.duration_ms = Date.now() - auditStartTime;
-          auditEntry.response_body = accumulated;
-          if (responseData?.usageMetadata || responseData?.response?.usageMetadata) {
-            auditEntry.usage = responseData?.usageMetadata || responseData?.response?.usageMetadata;
-          }
-          await env.auditLogStore.addLog(auditEntry);
-        } catch (_) {}
+      // IMPORTANT: never use readable.tee() here. tee() only re-pulls from the
+      // source once BOTH branches have drained, so a slow/unread audit branch
+      // stops the client branch forever — that stalled every streaming request.
+      // This passthrough instead pulls one chunk at a time, forwards it to the
+      // client immediately, and copies a bounded slice into the audit record.
+      const auditStreamLimit = 256 * 1024;
+      const decoder = new TextDecoder();
+      const sourceReader = readable.getReader();
+      let accumulated = "";
+      let finalized = false;
+      const finalize = (suffix) => {
+        if (finalized) return;
+        finalized = true;
+        let text = accumulated;
+        if (accumulated.length >= auditStreamLimit) {
+          text += "\n\n…[TRUNCATED: response exceeded 256 KB capture limit]";
+        }
+        if (suffix) text += suffix;
+        auditEntry.status_code = 200;
+        auditEntry.duration_ms = Date.now() - auditStartTime;
+        auditEntry.response_body = text;
+        const usage = responseData?.usageMetadata || responseData?.response?.usageMetadata;
+        if (usage) auditEntry.usage = usage;
+        // Deliberately not ctx.waitUntil(): the audit write must never be able
+        // to hold the response (or the request lifecycle) open.
+        Promise.resolve(env.auditLogStore.addLog(auditEntry)).catch(() => {});
       };
-      if (ctx?.waitUntil) {
-        ctx.waitUntil(captureStream());
-      } else {
-        captureStream().catch(() => {});
-      }
+      returnReadable = new ReadableStream({
+        async pull(controller) {
+          try {
+            const { done, value } = await sourceReader.read();
+            if (done) {
+              finalize("");
+              controller.close();
+              return;
+            }
+            if (value) {
+              if (accumulated.length < auditStreamLimit) {
+                try {
+                  accumulated += decoder.decode(value, { stream: true });
+                } catch (_) {}
+                if (accumulated.length > auditStreamLimit) accumulated = accumulated.slice(0, auditStreamLimit);
+              }
+            }
+            controller.enqueue(value);
+          } catch (err) {
+            finalize(`\n\n[STREAM ERROR: ${err?.message || err}]`);
+            try {
+              controller.error(err);
+            } catch (_) {}
+          }
+        },
+        cancel(reason) {
+          finalize("\n\n[CLIENT DISCONNECTED]");
+          try {
+            sourceReader.cancel(reason);
+          } catch (_) {}
+        }
+      });
     }
     return new Response(returnReadable, {
       headers: {

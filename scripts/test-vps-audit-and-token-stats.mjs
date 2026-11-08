@@ -1,262 +1,423 @@
+// Regression tests for the VPS-only audit log viewer + daily token stats.
+//
+// These tests deliberately exercise the paths that broke production:
+//   * a streaming request WITH audit logging enabled must still stream to the
+//     client in full (the old readable.tee() implementation deadlocked here),
+//   * a burst of large requests must not block the event loop on disk I/O
+//     (the old implementation rewrote the whole log file per request),
+//   * the dashboard script must compile.
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import fsp from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
+import vm from "node:vm";
 import { AuditLogStore, TokenStatsStore, normalizeTokenUsage, extractUsageFromText } from "../api/audit-log-store.js";
 import worker from "../src/worker.js";
 
 const tmpDir = path.join(os.tmpdir(), `test-gemplan-audit-${Date.now()}-${Math.random().toString(36).slice(2)}`);
 fs.mkdirSync(tmpDir, { recursive: true });
 
-try {
-  const auditLogPath = path.join(tmpDir, "request-audit-logs.json");
-  const tokenStatsPath = path.join(tmpDir, "daily-token-stats.json");
+const originalFetch = globalThis.fetch;
 
-  // ==========================================
-  // 1. Token normalization tests
-  // ==========================================
-  const googleMeta = {
+function makeKv(entries) {
+  const map = new Map(Object.entries(entries));
+  return {
+    map,
+    async get(key, type) {
+      const value = map.get(key);
+      if (value === undefined) return null;
+      if (type === "json") return typeof value === "string" ? JSON.parse(value) : structuredClone(value);
+      return typeof value === "string" ? value : JSON.stringify(value);
+    },
+    async put(key, value) {
+      map.set(key, typeof value === "string" ? value : JSON.stringify(value));
+    },
+    async delete(key) {
+      map.delete(key);
+    }
+  };
+}
+
+function makeCtx() {
+  const pending = [];
+  return {
+    waitUntil(promise) {
+      pending.push(Promise.resolve(promise));
+    },
+    async drain() {
+      await Promise.allSettled(pending);
+    }
+  };
+}
+
+function makeUser(customPath = "rt", apiKey = "sk-rt") {
+  return {
+    password_hash: "x",
+    machine_id: "m",
+    accounts: [
+      {
+        id: "acc_stream",
+        email: "stream@example.test",
+        mode: "antigravity",
+        enabled: true,
+        status: "active",
+        last_used_at: 0,
+        cooldown_until: 0,
+        machine_id: "m",
+        tokens: {
+          access_token: "token",
+          refresh_token: "refresh",
+          expires_at: Math.floor(Date.now() / 1000) + 3600,
+          project_id: "project"
+        }
+      }
+    ],
+    api_config: {
+      custom_path: customPath,
+      api_key: apiKey,
+      codeassist_pattern: "{modelname}",
+      antigravity_pattern: "{modelname}-agy"
+    }
+  };
+}
+
+function sseChunk(text, usage) {
+  return (
+    "data: " +
+    JSON.stringify({
+      response: {
+        candidates: [{ content: { role: "model", parts: [{ text }] }, finishReason: "STOP" }],
+        ...(usage ? { usageMetadata: usage } : {})
+      }
+    }) +
+    "\n\n"
+  );
+}
+
+function streamUpstream(chunkCount) {
+  const encoder = new TextEncoder();
+  return new Response(
+    new ReadableStream({
+      async start(controller) {
+        for (let i = 0; i < chunkCount; i++) {
+          controller.enqueue(encoder.encode(sseChunk(`part-${i} `)));
+          await new Promise((resolve) => setTimeout(resolve, 5));
+        }
+        controller.enqueue(
+          encoder.encode(sseChunk("DONE", { promptTokenCount: 11, candidatesTokenCount: 7, thoughtsTokenCount: 3, cachedContentTokenCount: 4, totalTokenCount: 21 }))
+        );
+        controller.close();
+      }
+    }),
+    { status: 200, headers: { "Content-Type": "text/event-stream" } }
+  );
+}
+
+async function readAllWithTimeout(body, timeoutMs) {
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  let text = "";
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) throw new Error(`stream stalled: only ${text.length} chars after ${timeoutMs}ms`);
+    const result = await Promise.race([
+      reader.read(),
+      new Promise((resolve) => setTimeout(() => resolve({ __timeout: true }), remaining))
+    ]);
+    if (result.__timeout) throw new Error(`stream stalled: only ${text.length} chars after ${timeoutMs}ms`);
+    if (result.done) break;
+    text += decoder.decode(result.value, { stream: true });
+    await new Promise((resolve) => setTimeout(resolve, 1)); // simulate a slow consumer
+  }
+  return text + decoder.decode();
+}
+
+try {
+  const auditPath = path.join(tmpDir, "request-audit-logs.jsonl");
+  const statsPath = path.join(tmpDir, "daily-token-stats.json");
+
+  // ---------------------------------------------------------------- tokens ---
+  const googleUsage = normalizeTokenUsage({
     promptTokenCount: 120,
     candidatesTokenCount: 50,
     thoughtsTokenCount: 15,
     cachedContentTokenCount: 30,
     totalTokenCount: 185
-  };
-  const normGoogle = normalizeTokenUsage(googleMeta);
-  assert.equal(normGoogle.prompt_tokens, 120);
-  assert.equal(normGoogle.output_tokens, 50);
-  assert.equal(normGoogle.reasoning_tokens, 15);
-  assert.equal(normGoogle.cached_tokens, 30);
-  assert.equal(normGoogle.total_tokens, 185);
+  });
+  assert.deepEqual(googleUsage, {
+    prompt_tokens: 120,
+    output_tokens: 50,
+    reasoning_tokens: 15,
+    cached_tokens: 30,
+    total_tokens: 185
+  });
 
-  const oaiUsage = {
+  const openAiUsage = normalizeTokenUsage({
     prompt_tokens: 200,
     completion_tokens: 80,
     total_tokens: 280,
     cache_read_input_tokens: 50
-  };
-  const normOai = normalizeTokenUsage(oaiUsage);
-  assert.equal(normOai.prompt_tokens, 200);
-  assert.equal(normOai.output_tokens, 80);
-  assert.equal(normOai.cached_tokens, 50);
-  assert.equal(normOai.total_tokens, 280);
+  });
+  assert.deepEqual(openAiUsage, {
+    prompt_tokens: 200,
+    output_tokens: 80,
+    reasoning_tokens: 0,
+    cached_tokens: 50,
+    total_tokens: 280
+  });
+  assert.equal(normalizeTokenUsage({}), null, "empty usage must be ignored");
 
-  const sseChunkText = 'data: {"response":{"usageMetadata":{"promptTokenCount":300,"candidatesTokenCount":90,"thoughtsTokenCount":20,"totalTokenCount":410}}}\n\n';
-  const extractedFromSse = extractUsageFromText(sseChunkText);
-  assert.ok(extractedFromSse);
-  assert.equal(extractedFromSse.prompt_tokens, 300);
-  assert.equal(extractedFromSse.output_tokens, 90);
-  assert.equal(extractedFromSse.reasoning_tokens, 20);
+  const sseTail = 'data: {"x":1}\n\n' + sseChunk("hi", { promptTokenCount: 300, candidatesTokenCount: 90, thoughtsTokenCount: 20, totalTokenCount: 410 });
+  const extracted = extractUsageFromText(sseTail);
+  assert.equal(extracted.prompt_tokens, 300);
+  assert.equal(extracted.output_tokens, 90);
+  assert.equal(extracted.reasoning_tokens, 20);
+  console.log("PASS: token usage normalization and SSE extraction");
 
-  console.log("PASS: Token normalization and SSE extraction tests");
-
-  // ==========================================
-  // 2. TokenStatsStore unit and persistence tests
-  // ==========================================
-  const tokenStore1 = new TokenStatsStore({ storagePath: tokenStatsPath });
+  // ----------------------------------------------------------- token stats ---
+  const tokenStore = new TokenStatsStore({ storagePath: statsPath });
   const nowMs = Date.now();
-  const oneDayMs = 24 * 60 * 60 * 1000;
+  tokenStore.recordUsage({ prompt_tokens: 1000, output_tokens: 400, reasoning_tokens: 100, cached_tokens: 300, total_tokens: 1500 }, nowMs);
+  tokenStore.recordUsage({ prompt_tokens: 500, output_tokens: 200, reasoning_tokens: 50, cached_tokens: 100, total_tokens: 750 }, nowMs);
+  tokenStore.recordUsage({ prompt_tokens: 2000, output_tokens: 800, reasoning_tokens: 200, cached_tokens: 500, total_tokens: 3000 }, nowMs - 86400000);
+  await tokenStore.persist();
+  assert.ok(fs.existsSync(statsPath), "token stats must be persisted");
 
-  // Record on today
-  tokenStore1.recordUsage({
-    prompt_tokens: 1000,
-    output_tokens: 400,
-    reasoning_tokens: 100,
-    cached_tokens: 300,
-    total_tokens: 1500
-  }, nowMs);
-
-  // Record another request on today to verify day-level aggregation
-  tokenStore1.recordUsage({
-    prompt_tokens: 500,
-    output_tokens: 200,
-    reasoning_tokens: 50,
-    cached_tokens: 100,
-    total_tokens: 750
-  }, nowMs);
-
-  // Record on yesterday
-  tokenStore1.recordUsage({
-    prompt_tokens: 2000,
-    output_tokens: 800,
-    reasoning_tokens: 200,
-    cached_tokens: 500,
-    total_tokens: 3000
-  }, nowMs - oneDayMs);
-
-  assert.ok(fs.existsSync(tokenStatsPath), "Token stats must persist to disk");
-
-  // Reload into a second instance to verify atomic file persistence
-  const tokenStore2 = new TokenStatsStore({ storagePath: tokenStatsPath });
-  const stats7 = tokenStore2.getStats({ days: 7 });
-
-  assert.equal(stats7.daily.length, 7, "Must generate continuous 7 days of daily records");
-  assert.equal(stats7.summary.request_count, 3, "Total 3 requests aggregated");
+  const reloaded = new TokenStatsStore({ storagePath: statsPath });
+  const stats7 = await reloaded.getStats({ days: 7 });
+  assert.equal(stats7.daily.length, 7, "must return a continuous 7-day series");
+  assert.equal(stats7.summary.request_count, 3);
   assert.equal(stats7.summary.prompt_tokens, 3500);
   assert.equal(stats7.summary.output_tokens, 1400);
   assert.equal(stats7.summary.reasoning_tokens, 350);
   assert.equal(stats7.summary.cached_tokens, 900);
   assert.equal(stats7.summary.total_tokens, 5250);
 
-  console.log("PASS: TokenStatsStore daily aggregation, persistence, and summary calculations");
+  const statsWithRange = await reloaded.getStats({ startDate: "2026-01-01", endDate: "2026-01-03" });
+  assert.equal(statsWithRange.daily.length, 3, "custom date range must be inclusive");
+  console.log("PASS: daily token stats aggregation, persistence, and range queries");
 
-  // ==========================================
-  // 3. AuditLogStore unit and persistence tests
-  // ==========================================
-  const auditStore1 = new AuditLogStore({
-    storagePath: auditLogPath,
-    tokenStatsStore: tokenStore2
-  });
-
-  await auditStore1.addLog({
-    id: "log_test_01",
+  // ---------------------------------------------------------- audit store ---
+  const auditStore = new AuditLogStore({ storagePath: auditPath, tokenStatsStore: reloaded });
+  await auditStore.addLog({
+    id: "log_a",
     timestamp: nowMs,
-    time_formatted: "2026-11-08 16:00:00",
     method: "POST",
-    url: "/v1/chat/completions",
+    url: "/rt/v1/chat/completions",
     status_code: 200,
     username: "admin",
-    model: "gemini-2.5-flash-agy",
-    request_body: { model: "gemini-2.5-flash-agy", messages: [{ role: "user", content: "Hello!" }] },
-    response_body: { id: "chatcmpl-1", choices: [{ message: { content: "Hi there!" } }] },
+    model: "gemini-test-agy",
+    request_body: '{"model":"gemini-test-agy"}',
+    response_body: '{"choices":[]}',
     usage: { prompt_tokens: 20, output_tokens: 10, total_tokens: 30 }
   });
-
-  await auditStore1.addLog({
-    id: "log_test_02",
+  await auditStore.addLog({
+    id: "log_b",
     timestamp: nowMs + 100,
-    time_formatted: "2026-11-08 16:00:01",
     method: "POST",
-    url: "/v1/messages",
+    url: "/rt/v1/messages",
     status_code: 200,
-    username: "userB",
-    model: "claude-3-7-sonnet-agy",
-    request_body: { model: "claude-3-7-sonnet-agy", messages: [{ role: "user", content: "Write a poem" }] },
-    response_body: { id: "msg-1", content: [{ type: "text", text: "Roses are red" }] },
+    username: "someone-else",
+    model: "claude-test-agy",
+    request_body: '{"model":"claude-test-agy"}',
+    response_body: '{"content":[]}',
     usage: { prompt_tokens: 40, output_tokens: 25, total_tokens: 65 }
   });
 
-  assert.ok(fs.existsSync(auditLogPath), "Audit log file must be written to disk");
+  assert.ok(fs.existsSync(auditPath), "audit log must be written as JSONL");
+  const rawAudit = await fsp.readFile(auditPath, "utf8");
+  assert.equal(rawAudit.trim().split("\n").length, 2, "one request must append exactly one line");
+  assert.ok(rawAudit.startsWith("{"), "JSONL storage must not be a JSON array");
 
-  const auditStore2 = new AuditLogStore({ storagePath: auditLogPath });
-  const logsLatest = await auditStore2.getLogs(10);
-  assert.equal(logsLatest.length, 2);
-  assert.equal(logsLatest[0].id, "log_test_02", "Newest log must be first (index 0)");
-  assert.equal(logsLatest[1].id, "log_test_01");
-  assert.equal(logsLatest[0].request_body.model, "claude-3-7-sonnet-agy");
+  const newest = await auditStore.getLogs(10);
+  assert.equal(newest.length, 2);
+  assert.equal(newest[0].id, "log_b", "newest entry must come first");
+  assert.equal((await auditStore.getLogs(1)).length, 1, "n must be honoured");
+  const adminOnly = await auditStore.getLogs(10, "admin");
+  assert.deepEqual(adminOnly.map((item) => item.id), ["log_a"]);
 
-  // Test user filtering
-  const adminLogs = await auditStore2.getLogs(10, "admin");
-  assert.equal(adminLogs.length, 1);
-  assert.equal(adminLogs[0].id, "log_test_01");
+  // Bodies larger than the capture limit must be truncated, never stored whole.
+  await auditStore.addLog({
+    id: "log_big",
+    timestamp: nowMs + 200,
+    status_code: 200,
+    request_body: "x".repeat(1024 * 1024),
+    response_body: "y".repeat(1024 * 1024)
+  });
+  const bigEntry = (await auditStore.getLogs(1))[0];
+  assert.equal(bigEntry.id, "log_big");
+  assert.ok(bigEntry.request_body.length < 300 * 1024, "oversized request body must be capped");
+  assert.ok(bigEntry.request_body.includes("TRUNCATED"), "truncation must be marked in the record");
+  console.log("PASS: audit log JSONL storage, ordering, filtering, n limit, and body caps");
 
-  // Test limit n
-  const limit1Logs = await auditStore2.getLogs(1);
-  assert.equal(limit1Logs.length, 1);
-  assert.equal(limit1Logs[0].id, "log_test_02");
-
-  console.log("PASS: AuditLogStore storage, ordering, user filtering, and limit n tests");
-
-  // ==========================================
-  // 4. Worker Endpoints & Dashboard Integration
-  // ==========================================
-  class MemoryKvStore {
-    constructor() { this.map = new Map(); }
-    async get(k, type) {
-      const v = this.map.get(k);
-      if (v == null) return null;
-      return type === "json" ? (typeof v === "string" ? JSON.parse(v) : v) : v;
+  // ------------------------------------------------- request-path pressure ---
+  // A burst of large requests must stay fast: the old implementation rewrote
+  // the entire log file synchronously for every single request.
+  {
+    const bulkStore = new AuditLogStore({ storagePath: path.join(tmpDir, "bulk.jsonl") });
+    const bigBody = "z".repeat(200 * 1024);
+    const started = Date.now();
+    const writes = [];
+    for (let i = 0; i < 40; i++) {
+      writes.push(
+        bulkStore.addLog({
+          id: `bulk_${i}`,
+          timestamp: nowMs + i,
+          status_code: 200,
+          request_body: bigBody,
+          response_body: bigBody
+        })
+      );
     }
-    async put(k, v) { this.map.set(k, typeof v === "string" ? v : JSON.stringify(v)); }
-    async delete(k) { this.map.delete(k); }
+    await Promise.all(writes);
+    const elapsed = Date.now() - started;
+    const bulkSize = (await fsp.stat(path.join(tmpDir, "bulk.jsonl"))).size;
+    assert.ok(elapsed < 5000, `40 audited requests must not take ${elapsed}ms (disk I/O must not block)`);
+    assert.ok(bulkSize < 24 * 1024 * 1024, "audit file must stay below the rotation threshold");
+    const bulkLogs = await bulkStore.getLogs(5);
+    assert.equal(bulkLogs.length, 5);
   }
+  console.log("PASS: audit writes stay off the critical path under burst load");
 
-  const kv = new MemoryKvStore();
-  await kv.put("user:admin", {
-    password_hash: "hash",
-    api_config: { custom_path: "admin", api_key: "sk-test-admin" },
-    accounts: []
-  });
-  await kv.put("session:sess_admin", "admin");
-  await kv.put("key:sk-test-admin", "admin");
-  await kv.put("path:admin", "admin");
+  // ------------------------------------------ end-to-end streaming + audit ---
+  {
+    const kv = makeKv({
+      "key:sk-rt": "runtime-user",
+      "user:runtime-user": JSON.stringify(makeUser())
+    });
+    const streamAudit = new AuditLogStore({ storagePath: path.join(tmpDir, "stream.jsonl") });
+    const env = { GEMINI_KV: kv, IS_VPS: "true", auditLogStore: streamAudit, tokenStatsStore: reloaded };
+    const ctx = makeCtx();
+    globalThis.fetch = async () => streamUpstream(12);
 
-  const vpsEnv = {
-    GEMINI_KV: kv,
-    IS_VPS: "true",
-    auditLogStore: auditStore2,
-    tokenStatsStore: tokenStore2
-  };
+    const response = await worker.fetch(
+      new Request("https://example.test/rt/v1/chat/completions", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: "Bearer sk-rt" },
+        body: JSON.stringify({ model: "gemini-test-agy", messages: [{ role: "user", content: "hi" }], stream: true })
+      }),
+      env,
+      ctx
+    );
 
-  const dummyCtx = { waitUntil: () => {}, drain: async () => {} };
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get("Content-Type"), "text/event-stream");
+    const streamed = await readAllWithTimeout(response.body, 8000);
+    assert.ok(streamed.includes("part-0"), "first chunk must reach the client");
+    assert.ok(streamed.includes("part-11"), "last chunk must reach the client");
+    assert.ok(streamed.includes("DONE"), "stream must be complete");
+    assert.ok(streamed.includes("[DONE]"), "stream must be terminated properly");
 
-  // 4a. Unauthorized access to /api/logs/recent and /api/token-stats must return 401
-  const unauthLogs = await worker.fetch(new Request("https://localhost/api/logs/recent?n=10"), vpsEnv, dummyCtx);
-  assert.equal(unauthLogs.status, 401, "Unauthenticated access to logs must be rejected with 401");
+    await ctx.drain();
+    await streamAudit.appendChain;
+    const recorded = await streamAudit.getLogs(5);
+    assert.equal(recorded.length, 1, "the streamed request must be audited");
+    assert.equal(recorded[0].model, "gemini-test-agy");
+    assert.equal(recorded[0].status_code, 200);
+    assert.ok(recorded[0].request_body.includes("gemini-test-agy"), "request body must be captured");
+    assert.ok(recorded[0].response_body.includes("part-0"), "streamed response body must be captured");
+    assert.ok(recorded[0].duration_ms >= 0);
+    globalThis.fetch = originalFetch;
+  }
+  console.log("PASS: streaming request completes while audit logging is enabled");
 
-  const unauthStats = await worker.fetch(new Request("https://localhost/api/token-stats?days=7"), vpsEnv, dummyCtx);
-  assert.equal(unauthStats.status, 401, "Unauthenticated access to token stats must be rejected with 401");
+  // --------------------------------------- non-streaming + failure capture ---
+  {
+    const kv = makeKv({
+      "key:sk-rt": "runtime-user",
+      "user:runtime-user": JSON.stringify(makeUser())
+    });
+    const plainAudit = new AuditLogStore({ storagePath: path.join(tmpDir, "plain.jsonl") });
+    const env = { GEMINI_KV: kv, IS_VPS: "true", auditLogStore: plainAudit };
+    globalThis.fetch = async () =>
+      new Response(
+        JSON.stringify({
+          response: {
+            candidates: [{ content: { role: "model", parts: [{ text: "plain-ok" }] }, finishReason: "STOP" }],
+            usageMetadata: { promptTokenCount: 9, candidatesTokenCount: 4, totalTokenCount: 13 }
+          }
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } }
+      );
 
-  // 4b. Authenticated access returns valid JSON
-  const authLogsReq = new Request("https://localhost/api/logs/recent?n=1", {
-    headers: { "Cookie": "session_id=sess_admin" }
-  });
-  const authLogsRes = await worker.fetch(authLogsReq, vpsEnv, dummyCtx);
-  assert.equal(authLogsRes.status, 200);
-  const logsJson = await authLogsRes.json();
-  assert.equal(logsJson.success, true);
-  assert.equal(logsJson.n, 1);
-  assert.equal(logsJson.logs.length, 1);
-  assert.ok(logsJson.logs[0].request_body, "Request body must be present");
-  assert.ok(logsJson.logs[0].response_body, "Response body must be present");
+    const response = await worker.fetch(
+      new Request("https://example.test/rt/v1/chat/completions", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: "Bearer sk-rt" },
+        body: JSON.stringify({ model: "gemini-test-agy", messages: [{ role: "user", content: "hi" }] })
+      }),
+      env,
+      makeCtx()
+    );
+    const payload = await response.json();
+    assert.equal(payload.choices[0].message.content, "plain-ok");
+    await plainAudit.appendChain;
+    const entries = await plainAudit.getLogs(5);
+    assert.equal(entries.length, 1);
+    assert.equal(entries[0].is_stream, false);
+    assert.equal(entries[0].status_code, 200);
+    globalThis.fetch = originalFetch;
+  }
+  console.log("PASS: non-streaming request still returns its payload and is audited");
 
-  // 4c. Authenticated access to /api/token-stats
-  const authStatsReq = new Request("https://localhost/api/token-stats?days=7", {
-    headers: { "Cookie": "session_id=sess_admin" }
-  });
-  const authStatsRes = await worker.fetch(authStatsReq, vpsEnv, dummyCtx);
-  assert.equal(authStatsRes.status, 200);
-  const statsJson = await authStatsRes.json();
-  assert.equal(statsJson.success, true);
-  assert.equal(statsJson.daily.length, 7);
-  assert.ok(statsJson.summary.total_tokens > 0);
+  // --------------------------------------------------- dashboard / routes ---
+  {
+    const kv = makeKv({
+      "key:sk-admin": "admin",
+      "session:sess_admin": "admin",
+      "user:admin": JSON.stringify({ ...makeUser("admin", "sk-admin"), accounts: [] })
+    });
+    const audit = new AuditLogStore({ storagePath: path.join(tmpDir, "dash.jsonl"), tokenStatsStore: reloaded });
+    await audit.addLog({ id: "dash_1", timestamp: Date.now(), status_code: 200, username: "admin", request_body: '{"a":1}', response_body: '{"b":2}' });
+    const env = { GEMINI_KV: kv, IS_VPS: "true", auditLogStore: audit, tokenStatsStore: reloaded };
 
-  // 4d. Dashboard HTML in VPS mode contains Card 5 and Card 6
-  const dashReq = new Request("https://localhost/dashboard", {
-    headers: { "Cookie": "session_id=sess_admin" }
-  });
-  const dashRes = await worker.fetch(dashReq, vpsEnv, dummyCtx);
-  assert.equal(dashRes.status, 200);
-  const dashHtml = await dashRes.text();
+    const unauth = await worker.fetch(new Request("https://example.test/api/logs/recent?n=5"), env, makeCtx());
+    assert.equal(unauth.status, 401, "audit log endpoint must require a session");
+    const unauthStats = await worker.fetch(new Request("https://example.test/api/token-stats?days=7"), env, makeCtx());
+    assert.equal(unauthStats.status, 401, "token stats endpoint must require a session");
 
-  assert.ok(dashHtml.includes("id=\"audit-logs-card\""), "Dashboard in VPS mode must contain audit logs card");
-  assert.ok(dashHtml.includes("id=\"view-audit-logs-btn\""), "Dashboard in VPS mode must contain view audit logs button");
-  assert.ok(dashHtml.includes("id=\"audit-log-n\""), "Dashboard in VPS mode must contain n input for user setting");
-  assert.ok(dashHtml.includes("id=\"token-stats-card\""), "Dashboard in VPS mode must contain token stats card");
-  assert.ok(dashHtml.includes("id=\"token-bar-svg\""), "Dashboard in VPS mode must contain token bar svg");
-  assert.ok(dashHtml.includes("fetchRecentAuditLogs"), "Dashboard in VPS mode must have fetchRecentAuditLogs script");
-  assert.ok(dashHtml.includes("renderTokenBarChart"), "Dashboard in VPS mode must have renderTokenBarChart script");
+    const cookie = { Cookie: "session_id=sess_admin" };
+    const logsRes = await worker.fetch(new Request("https://example.test/api/logs/recent?n=1", { headers: cookie }), env, makeCtx());
+    assert.equal(logsRes.status, 200);
+    const logsJson = await logsRes.json();
+    assert.equal(logsJson.success, true);
+    assert.equal(logsJson.logs.length, 1);
+    assert.equal(logsJson.logs[0].request_body, '{"a":1}');
 
-  // Verify that the injected script has zero syntax errors
-  const scriptMatch = dashHtml.match(/<script>([\s\S]*?)<\/script>/i);
-  assert.ok(scriptMatch, "Dashboard HTML must contain a script block");
-  const vm = await import("node:vm");
-  assert.doesNotThrow(() => {
-    new vm.Script(scriptMatch[1]);
-  }, "Dashboard embedded JavaScript must compile with zero syntax errors");
+    const statsRes = await worker.fetch(new Request("https://example.test/api/token-stats?days=7", { headers: cookie }), env, makeCtx());
+    assert.equal(statsRes.status, 200);
+    const statsJson = await statsRes.json();
+    assert.equal(statsJson.daily.length, 7);
 
-  // 4e. Dashboard HTML in non-VPS mode (Cloudflare Worker) omits Card 5 and Card 6
-  const cfEnv = { GEMINI_KV: kv, IS_VPS: "false" };
-  const cfDashRes = await worker.fetch(dashReq, cfEnv, dummyCtx);
-  assert.equal(cfDashRes.status, 200);
-  const cfDashHtml = await cfDashRes.text();
-  assert.ok(!cfDashHtml.includes("id=\"audit-logs-card\""), "CF Worker dashboard must NOT contain audit logs card");
-  assert.ok(!cfDashHtml.includes("id=\"token-stats-card\""), "CF Worker dashboard must NOT contain token stats card");
+    const clearRes = await worker.fetch(new Request("https://example.test/api/logs/clear", { method: "POST", headers: cookie }), env, makeCtx());
+    assert.equal(clearRes.status, 200);
+    assert.equal((await audit.getLogs(5)).length, 0, "clear must empty the audit log");
 
-  console.log("PASS: Worker endpoints and Dashboard HTML rendering for VPS vs CF Worker");
+    // The dashboard must render both cards and its inline script must compile.
+    const dashRes = await worker.fetch(new Request("https://example.test/dashboard", { headers: cookie }), env, makeCtx());
+    assert.equal(dashRes.status, 200);
+    const dashHtml = await dashRes.text();
+    assert.ok(dashHtml.includes('id="audit-logs-card"'));
+    assert.ok(dashHtml.includes('id="audit-log-n"'));
+    assert.ok(dashHtml.includes('id="token-stats-card"'));
+    assert.ok(dashHtml.includes('id="token-bar-svg"'));
+    const scriptMatch = dashHtml.match(/<script>([\s\S]*?)<\/script>/i);
+    assert.ok(scriptMatch, "dashboard must embed its client script");
+    assert.doesNotThrow(() => new vm.Script(scriptMatch[1]), "dashboard client script must compile");
 
-  console.log("\nALL VPS AUDIT LOGS & TOKEN STATS TESTS PASSED!");
+    // Cloudflare deployments must not render VPS-only cards.
+    const cfDash = await worker.fetch(new Request("https://example.test/dashboard", { headers: cookie }), { GEMINI_KV: kv }, makeCtx());
+    const cfHtml = await cfDash.text();
+    assert.ok(!cfHtml.includes('id="audit-logs-card"'));
+    assert.ok(!cfHtml.includes('id="token-stats-card"'));
+  }
+  console.log("PASS: dashboard routes, auth guards, and VPS-vs-Cloudflare rendering");
+
+  console.log("\nALL VPS AUDIT & TOKEN STATS TESTS PASSED!");
 } finally {
+  globalThis.fetch = originalFetch;
   try {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   } catch {}
