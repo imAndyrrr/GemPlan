@@ -3509,9 +3509,9 @@ async function handleDashboard(request, env) {
       </div>
 
       <div style="display:flex; justify-content:center; gap:14px; font-size:11px; color:#555; margin-bottom:8px; flex-wrap:wrap;">
-        <span style="display:inline-flex; align-items:center; gap:4px;"><span style="display:inline-block; width:10px; height:10px; background:#007bff; border-radius:2px;"></span>\u8BFB\u53D6/Prompt</span>
-        <span style="display:inline-flex; align-items:center; gap:4px;"><span style="display:inline-block; width:10px; height:10px; background:#17a2b8; border-radius:2px;"></span>\u7F13\u5B58 Cached</span>
-        <span style="display:inline-flex; align-items:center; gap:4px;"><span style="display:inline-block; width:10px; height:10px; background:#28a745; border-radius:2px;"></span>\u8F93\u51FA Output</span>
+        <span style="display:inline-flex; align-items:center; gap:4px;"><span style="display:inline-block; width:10px; height:10px; background:#007bff; border-radius:2px;"></span>\u672A\u7F13\u5B58\u8BFB\u53D6 (\u8F93\u5165-\u7F13\u5B58)</span>
+        <span style="display:inline-flex; align-items:center; gap:4px;"><span style="display:inline-block; width:10px; height:10px; background:#17a2b8; border-radius:2px;"></span>\u7F13\u5B58\u547D\u4E2D Cached</span>
+        <span style="display:inline-flex; align-items:center; gap:4px;"><span style="display:inline-block; width:10px; height:10px; background:#28a745; border-radius:2px;"></span>\u6A21\u578B\u8F93\u51FA Output</span>
         <span style="display:inline-flex; align-items:center; gap:4px;"><span style="display:inline-block; width:10px; height:10px; background:#fd7e14; border-radius:2px;"></span>\u601D\u8003 Reasoning</span>
       </div>
 
@@ -4298,18 +4298,25 @@ async function handleDashboard(request, env) {
           const x = idx * colWidth + Math.floor((colWidth - barWidth) / 2);
           const total = d.total_tokens || 0;
 
-          const hPrompt = total > 0 ? Math.round(((d.prompt_tokens || 0) / maxTotal) * chartHeight) : 0;
-          const hCached = total > 0 ? Math.round(((d.cached_tokens || 0) / maxTotal) * chartHeight) : 0;
-          const hOutput = total > 0 ? Math.round(((d.output_tokens || 0) / maxTotal) * chartHeight) : 0;
-          const hReasoning = total > 0 ? Math.round(((d.reasoning_tokens || 0) / maxTotal) * chartHeight) : 0;
+          const cachedTokens = d.cached_tokens || 0;
+          // prompt_tokens contains total input (including cached). To make stacked
+          // parts non-overlapping and sum up to total, un-cached prompt is prompt - cached.
+          const uncachePrompt = Math.max(0, (d.prompt_tokens || 0) - cachedTokens);
+          const outputTokens = d.output_tokens || 0;
+          const reasoningTokens = d.reasoning_tokens || 0;
+
+          const hUncached = total > 0 ? Math.round((uncachePrompt / maxTotal) * chartHeight) : 0;
+          const hCached = total > 0 ? Math.round((cachedTokens / maxTotal) * chartHeight) : 0;
+          const hOutput = total > 0 ? Math.round((outputTokens / maxTotal) * chartHeight) : 0;
+          const hReasoning = total > 0 ? Math.round((reasoningTokens / maxTotal) * chartHeight) : 0;
 
           const baseBottom = chartHeight + 20;
           let currentY = baseBottom;
 
           let barParts = "";
-          if (hPrompt > 0) {
-            currentY -= hPrompt;
-            barParts += '<rect x="' + x + '" y="' + currentY + '" width="' + barWidth + '" height="' + hPrompt + '" fill="#007bff" rx="0" />';
+          if (hUncached > 0) {
+            currentY -= hUncached;
+            barParts += '<rect x="' + x + '" y="' + currentY + '" width="' + barWidth + '" height="' + hUncached + '" fill="#007bff" rx="0" />';
           }
           if (hCached > 0) {
             currentY -= hCached;
@@ -4348,7 +4355,8 @@ async function handleDashboard(request, env) {
         if (!daily || !daily[idx] || !detailEl) return;
         const d = daily[idx];
         detailEl.style.display = "block";
-        detailEl.innerHTML = '<b>' + agEscHtml(d.date) + '</b> \u00B7 \u603B Token: <b>' + fmtTokensFull(d.total_tokens) + '</b> (\u8BFB\u53D6: <span style="color:#007bff;font-weight:bold;">' + fmtTokensFull(d.prompt_tokens) + '</span> \u00B7 \u7F13\u5B58: <span style="color:#17a2b8;font-weight:bold;">' + fmtTokensFull(d.cached_tokens) + '</span> \u00B7 \u8F93\u51FA: <span style="color:#28a745;font-weight:bold;">' + fmtTokensFull(d.output_tokens) + '</span> \u00B7 \u601D\u8003: <span style="color:#fd7e14;font-weight:bold;">' + fmtTokensFull(d.reasoning_tokens) + '</span>) \u00B7 \u8BF7\u6C42\u6B21\u6570: <b>' + d.request_count + '</b> \u6B21';
+        const uncacheVal = Math.max(0, (d.prompt_tokens || 0) - (d.cached_tokens || 0));
+        detailEl.innerHTML = '<b>' + agEscHtml(d.date) + '</b> \u00B7 \u603B Token: <b>' + fmtTokensFull(d.total_tokens) + '</b> (\u603B\u8BFB\u53D6: <span style="color:#007bff;font-weight:bold;">' + fmtTokensFull(d.prompt_tokens) + '</span> [\u672A\u7F13\u5B58: ' + fmtTokensFull(uncacheVal) + '] \u00B7 \u7F13\u5B58: <span style="color:#17a2b8;font-weight:bold;">' + fmtTokensFull(d.cached_tokens) + '</span> \u00B7 \u8F93\u51FA: <span style="color:#28a745;font-weight:bold;">' + fmtTokensFull(d.output_tokens) + '</span> \u00B7 \u601D\u8003: <span style="color:#fd7e14;font-weight:bold;">' + fmtTokensFull(d.reasoning_tokens) + '</span>) \u00B7 \u8BF7\u6C42\u6B21\u6570: <b>' + d.request_count + '</b> \u6B21';
       }
 
       if (${isVps ? "true" : "false"}) {
