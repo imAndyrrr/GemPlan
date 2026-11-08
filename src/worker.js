@@ -3470,6 +3470,9 @@ async function handleDashboard(request, env) {
         <button type="button" class="btn-sm token-range-btn" onclick="fetchTokenStats(7, this)" style="background:#007bff; color:#fff;">\u6700\u8FD1 7 \u5929</button>
         <button type="button" class="btn-sm token-range-btn" onclick="fetchTokenStats(14, this)" style="background:#6c757d; color:#fff;">\u6700\u8FD1 14 \u5929</button>
         <button type="button" class="btn-sm token-range-btn" onclick="fetchTokenStats(30, this)" style="background:#6c757d; color:#fff;">\u6700\u8FD1 30 \u5929</button>
+        <button type="button" id="refresh-token-stats-btn" class="btn-sm" onclick="refreshTokenStats()" style="background:#17a2b8; color:#fff; display:flex; align-items:center; gap:4px;" title="\u5237\u65B0\u5F53\u524D\u65F6\u95F4\u8303\u56F4\u7684\u7EDF\u8BA1\u6570\u636E">
+          &#x21bb; \u5237\u65B0
+        </button>
         <div style="display:flex; align-items:center; gap:4px; margin-left:auto; flex-wrap:wrap;">
           <input type="date" id="token-start-date" style="padding:4px 6px; font-size:12px; width:auto; margin:0; border:1px solid #ced4da; border-radius:4px;">
           <span style="font-size:12px; color:#666;">~</span>
@@ -4182,7 +4185,12 @@ async function handleDashboard(request, env) {
         return n + "B";
       }
 
+      let currentTokenRangeDays = 7;
+      let currentTokenIsCustom = false;
+
       async function fetchTokenStats(days, btnEl) {
+        currentTokenRangeDays = days;
+        currentTokenIsCustom = false;
         if (btnEl) {
           document.querySelectorAll(".token-range-btn").forEach(b => {
             b.style.background = "#6c757d";
@@ -4208,6 +4216,7 @@ async function handleDashboard(request, env) {
           alert("\u8BF7\u9009\u62E9\u5F00\u59CB\u548C\u7ED3\u675F\u65E5\u671F");
           return;
         }
+        currentTokenIsCustom = true;
         document.querySelectorAll(".token-range-btn").forEach(b => {
           b.style.background = "#6c757d";
         });
@@ -4220,6 +4229,25 @@ async function handleDashboard(request, env) {
           renderTokenBarChart(data);
         } catch (e) {
           if (statusEl) statusEl.textContent = "\u83B7\u53D6 Token \u7528\u91CF\u5931\u8D25: " + e.message;
+        }
+      }
+
+      async function refreshTokenStats() {
+        const refreshBtn = document.getElementById("refresh-token-stats-btn");
+        if (refreshBtn) refreshBtn.disabled = true;
+        try {
+          if (currentTokenIsCustom) {
+            await fetchTokenStatsCustom();
+          } else {
+            const btns = document.querySelectorAll(".token-range-btn");
+            let activeBtn = null;
+            btns.forEach(b => {
+              if (b.textContent.includes(String(currentTokenRangeDays))) activeBtn = b;
+            });
+            await fetchTokenStats(currentTokenRangeDays, activeBtn);
+          }
+        } finally {
+          if (refreshBtn) refreshBtn.disabled = false;
         }
       }
 

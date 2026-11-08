@@ -482,6 +482,7 @@ try {
     assert.ok(dashHtml.includes('id="audit-log-n"'));
     assert.ok(dashHtml.includes('id="token-stats-card"'));
     assert.ok(dashHtml.includes('id="token-bar-svg"'));
+    assert.ok(dashHtml.includes('id="refresh-token-stats-btn"'), "dashboard must include token stats refresh button");
     const scriptMatch = dashHtml.match(/<script>([\s\S]*?)<\/script>/i);
     assert.ok(scriptMatch, "dashboard must embed its client script");
     assert.doesNotThrow(() => new vm.Script(scriptMatch[1]), "dashboard client script must compile");
