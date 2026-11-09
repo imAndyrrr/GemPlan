@@ -221,8 +221,7 @@ try {
     assert.equal(view.summary.output_tokens, 33, "output tokens must be merged, not overwritten");
   }
   const onDisk = JSON.parse(fs.readFileSync(sharedStatsPath, "utf8"));
-  const today = new Date(nowMs);
-  const todayKey = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, "0")}-${String(today.getDate()).padStart(2, "0")}`;
+  const todayKey = new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Shanghai", year: "numeric", month: "2-digit", day: "2-digit" }).format(new Date(nowMs));
   assert.equal(onDisk[todayKey].request_count, 3, "the shared file must hold the merged totals");
 
   // A worker that has not flushed yet must still see its own usage.

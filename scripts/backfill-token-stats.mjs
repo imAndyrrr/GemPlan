@@ -11,6 +11,7 @@ async function main() {
   const lines = raw.split("\n");
 
   const store = new TokenStatsStore({ storagePath: statsFile });
+  await store.clearStats();
   await store.ready();
 
   let parsedCount = 0;

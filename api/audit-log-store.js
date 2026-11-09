@@ -83,9 +83,15 @@ export function extractUsageFromText(text) {
   return null;
 }
 
-function dayKey(ms) {
+function dayKey(ms, timeZone = "Asia/Shanghai") {
   const d = new Date(ms);
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+  const formatter = new Intl.DateTimeFormat("en-CA", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit"
+  });
+  return formatter.format(d);
 }
 
 function emptyDay(date) {
@@ -317,10 +323,25 @@ export class TokenStatsStore {
     const daily = [];
     const summary = emptyDay("");
     summary.date = null;
-    let cursor = new Date(start);
-    let guard = 0;
-    while (cursor <= end && guard++ < 400) {
-      const key = dayKey(cursor.getTime());
+    const dateList = [];
+    const nowMs = Date.now();
+    const span = Math.max(1, Math.min(365, Number(days) || 7));
+    if (startDate && endDate) {
+      let cur = new Date(startDate);
+      const stop = new Date(endDate);
+      let g = 0;
+      while (cur <= stop && g++ < 400) {
+        const k = `${cur.getFullYear()}-${String(cur.getMonth() + 1).padStart(2, "0")}-${String(cur.getDate()).padStart(2, "0")}`;
+        dateList.push(k);
+        cur.setDate(cur.getDate() + 1);
+      }
+    } else {
+      for (let i = span - 1; i >= 0; i--) {
+        dateList.push(dayKey(nowMs - i * 86400000));
+      }
+    }
+
+    for (const key of dateList) {
       const row = map[key] || emptyDay(key);
       daily.push(row);
       summary.prompt_tokens += row.prompt_tokens;
@@ -329,7 +350,6 @@ export class TokenStatsStore {
       summary.cached_tokens += row.cached_tokens;
       summary.total_tokens += row.total_tokens;
       summary.request_count += row.request_count;
-      cursor.setDate(cursor.getDate() + 1);
     }
     return { daily, summary };
   }
