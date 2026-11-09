@@ -3329,7 +3329,7 @@ async function handleDashboard(request, env) {
                   <span style="font-size:11px; color:#495057; background:#e9ecef; border-radius:3px; padding:1px 5px;">优先级 ${Math.min(100, Math.max(0, Number.isFinite(Number(acc.priority)) ? Number(acc.priority) : 0))}</span>
                 </div>
                 <div style="font-size:12px; color:#6c757d;">
-                  \u72B6\u6001: ${statusBadge}
+                  \u6388\u6743\u72B6\u6001: ${statusBadge}
                   ${acc.last_used_at ? ` \u00B7 \u6700\u8FD1\u4F7F\u7528: ${new Date(acc.last_used_at * 1000).toLocaleTimeString()}` : ''}
                   ${acc.error_message ? ` \u00B7 <span style="color:#dc3545;">${escapeHtml(acc.error_message)}</span>` : ''}
                 </div>
@@ -3883,13 +3883,13 @@ async function handleDashboard(request, env) {
             html += '<b>\uD83D\uDCCA \u5F53\u524D\u914D\u989D\u6C60\u8D26\u53F7\u72B6\u6001 (' + data.accounts.length + ' \u4E2A):</b><div style="margin-top:6px;display:flex;flex-direction:column;gap:4px;">';
             for (var aIdx = 0; aIdx < data.accounts.length; aIdx++) {
               var accInfo = data.accounts[aIdx];
-              var accStatusText = accInfo.enabled ? '<span style="color:#28a745;">\u2705 \u542F\u7528</span>' : '<span style="color:#6c757d;">\u26AA \u7981\u7528</span>';
+              var accStatusText = accInfo.enabled ? '<span style="color:#28a745;">\u2705 \u5DF2\u542F\u7528</span>' : '<span style="color:#6c757d;">\u26AA \u5DF2\u7981\u7528</span>';
               if (accInfo.status === "cooldown") accStatusText = '<span style="color:#fd7e14;">\u23F3 \u51B7\u5374\u4E2D</span>';
               if (accInfo.status === "error") accStatusText = '<span style="color:#dc3545;">\u274C \u5F02\u5E38</span>';
               if (accInfo.status === "quota_unavailable") accStatusText = '<span style="color:#fd7e14;">\u26A0\uFE0F \u914D\u989D\u67E5\u8BE2\u53D7\u9650</span>';
               html += '<div style="display:flex;justify-content:space-between;align-items:center;">';
               html += '<span>\u00B7 ' + agEscHtml(accInfo.email || accInfo.id) + (accInfo.name ? ' (' + agEscHtml(accInfo.name) + ')' : '') + '</span>';
-              html += '<span>' + accStatusText + '</span>';
+              html += '<span>' + accStatusText + ' (Google Token \u6709\u6548)</span>';
               html += '</div>';
             }
             html += '</div></div>';
@@ -4847,7 +4847,7 @@ async function rankAccountsForRequest(accounts, resolvedModel, username, env, co
         } else {
           const pct = checkModelQuota(quotaData, resolvedModel);
           if (pct === 0) {
-            score = 0;
+            score = -5000; // Deprioritize exhausted accounts behind any account with remaining quota or unknown quota
           } else if (typeof pct === "number") {
             score = 10000 + pct * 100;
           }
@@ -4860,7 +4860,10 @@ async function rankAccountsForRequest(accounts, resolvedModel, username, env, co
     const inFlight = getAccountInFlight(username, acc.id);
     // Healthy/available accounts should always be selected before cooling/error accounts,
     // even if the cooling account has a nominally higher manual priority.
-    const isAvailable = score > 0 ? 1 : 0;
+    // An account is usable as long as it's not error (-20000), forbidden (-15000),
+    // eligibility blocked (-12000), or cooling down (-10000). A quota-exhausted account (score -5000)
+    // is still structurally available as a last resort before giving up.
+    const isAvailable = score > -10000 ? 1 : 0;
     scored.push({ account: acc, score, lastUsed, priority, isAvailable, inFlight });
   }
 
