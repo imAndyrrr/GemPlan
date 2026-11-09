@@ -52,6 +52,10 @@ ${extract("decrementAccountInFlight")}
 ${extract("getAccountEligibilityKey")}
 ${extract("getAccountEligibilityBlockUntil")}
 ${extract("getAccountEligibilityBlocks")}
+const accountUnsupportedModels = new Map();
+${extract("markAccountModelUnsupported")}
+${extract("isAccountModelMarkedUnsupported")}
+${extract("isAccountSupportingModel")}
 ${extract("saveUser")}
 async function getAccountCooldowns(accounts) {
   return new Map((accounts || [])
@@ -443,5 +447,38 @@ if (rankedConcurrent[0].id !== "acc_idle") {
 }
 decrementAccountInFlight("concurrent-user", "acc_busy");
 console.log("PASS: In-flight concurrency load-balancing routes requests away from busy accounts");
+
+// Test: Model capability intelligent routing (pre-seeded models & 404 learning)
+const modelCapabilityAccounts = [
+  {
+    id: "acc_claude_unsupported",
+    mode: "antigravity",
+    enabled: true,
+    status: "active",
+    priority: 100, // High manual priority, but lacks Claude 5.5
+    last_used_at: 100,
+    tokens: { access_token: "tok-ag1" }
+  },
+  {
+    id: "acc_claude_supported",
+    mode: "antigravity",
+    enabled: true,
+    status: "active",
+    priority: 0, // Lower manual priority, but has Claude 5.5
+    last_used_at: 200,
+    tokens: { access_token: "tok-ag2" }
+  }
+];
+seedQuota("testuser", "acc_claude_unsupported", {
+  models: [{ name: "gemini-3.8-flash-high", percentage: 100 }]
+});
+seedQuota("testuser", "acc_claude_supported", {
+  models: [{ name: "claude-sonnet-5-5-low", percentage: 100 }]
+});
+const rankedForClaude = await rankAccountsForRequest(modelCapabilityAccounts, "claude-sonnet-5-5-low", "testuser", { GEMINI_KV: mockKV });
+if (rankedForClaude[0].id !== "acc_claude_supported") {
+  throw new Error(`Expected model-capable account 'acc_claude_supported' to be ranked first, got ${rankedForClaude[0].id}`);
+}
+console.log("PASS: model capability pre-seeded routing prioritizes capable account over higher priority incapable account");
 
 console.log("\nALL MULTI-ACCOUNT & QUOTA TESTS PASSED!");

@@ -4802,6 +4802,43 @@ async function ensureValidAccountToken(account, mode, env, user, username, ctx) 
 __name(ensureValidAccountToken, "ensureValidAccountToken");
 __name2(ensureValidAccountToken, "ensureValidAccountToken");
 
+var accountUnsupportedModels = /* @__PURE__ */ new Map();
+function markAccountModelUnsupported(username, accountId, modelName) {
+  if (!username || !accountId || !modelName) return;
+  const key = `${username}:${accountId}`;
+  let set = accountUnsupportedModels.get(key);
+  if (!set) {
+    set = /* @__PURE__ */ new Set();
+    accountUnsupportedModels.set(key, set);
+  }
+  set.add(modelName.trim().toLowerCase());
+}
+function isAccountModelMarkedUnsupported(username, accountId, modelName) {
+  if (!username || !accountId || !modelName) return false;
+  const set = accountUnsupportedModels.get(`${username}:${accountId}`);
+  return set ? set.has(modelName.trim().toLowerCase()) : false;
+}
+function isAccountSupportingModel(account, quotaData, resolvedModel, username) {
+  if (!resolvedModel) return true;
+  const targetLower = resolvedModel.trim().toLowerCase();
+  if (isAccountModelMarkedUnsupported(username, account?.id, targetLower)) {
+    return false;
+  }
+  if (quotaData && Array.isArray(quotaData.models) && quotaData.models.length > 0) {
+    const pct = checkModelQuota(quotaData, targetLower);
+    if (pct !== null) return true;
+    return false;
+  }
+  if (Array.isArray(account?.supported_models) && account.supported_models.length > 0) {
+    const has = account.supported_models.some((m) => {
+      const ml = (m || "").toLowerCase();
+      return ml === targetLower || ml.startsWith(targetLower) || targetLower.startsWith(ml);
+    });
+    return has;
+  }
+  return null;
+}
+
 async function rankAccountsForRequest(accounts, resolvedModel, username, env, colo = null) {
   if (!Array.isArray(accounts) || accounts.length === 0) return [];
   if (accounts.length === 1) return accounts.slice();
@@ -4830,6 +4867,7 @@ async function rankAccountsForRequest(accounts, resolvedModel, username, env, co
 
   for (const acc of accounts) {
     let score = 10000;
+    let isModelEligible = 1;
     const cooldownUntil = Math.max(Number(acc.cooldown_until) || 0, cooldownByAccountId.get(acc.id) || 0);
     const eligibilityUntil = eligibilityByAccountId.get(acc.id) || 0;
     const inCooldown = cooldownUntil > now;
@@ -4843,6 +4881,10 @@ async function rankAccountsForRequest(accounts, resolvedModel, username, env, co
       score = -20000;
     } else if (acc.mode === "antigravity") {
       const quotaData = quotaByAccountId.get(acc.id) || null;
+      const supportStatus = isAccountSupportingModel(acc, quotaData, resolvedModel, username);
+      if (supportStatus === false) {
+        isModelEligible = 0;
+      }
 
       if (quotaData) {
         if (quotaData.is_forbidden) {
@@ -4856,6 +4898,9 @@ async function rankAccountsForRequest(accounts, resolvedModel, username, env, co
           }
         }
       }
+      if (supportStatus === false) {
+        score = -8000;
+      }
     }
 
     const lastUsed = getEffectiveLastUsed(username, acc);
@@ -4867,13 +4912,14 @@ async function rankAccountsForRequest(accounts, resolvedModel, username, env, co
     // eligibility blocked (-12000), or cooling down (-10000). A quota-exhausted account (score -5000)
     // is still structurally available as a last resort before giving up.
     const isAvailable = score > -10000 ? 1 : 0;
-    scored.push({ account: acc, score, lastUsed, priority, isAvailable, inFlight });
+    scored.push({ account: acc, score, lastUsed, priority, isAvailable, isModelEligible, inFlight });
   }
 
-  // Availability first, then strict manual priority tier, then in-flight concurrency,
-  // then quota/status score, then LRU tie-breaker.
+  // Availability first, then model eligibility, then strict manual priority tier,
+  // then in-flight concurrency, then quota/status score, then LRU tie-breaker.
   scored.sort((a, b) =>
     b.isAvailable - a.isAvailable ||
+    b.isModelEligible - a.isModelEligible ||
     b.priority - a.priority ||
     a.inFlight - b.inFlight ||
     b.score - a.score ||
@@ -5501,6 +5547,11 @@ async function fetchAccountAntigravityQuotaData(account, username, env, ctx, for
       is_forbidden: false,
       forbidden_reason: null
     };
+    const modelNames = models.map((m) => m.name.toLowerCase());
+    if (!Array.isArray(account.supported_models) || JSON.stringify(account.supported_models) !== JSON.stringify(modelNames)) {
+      account.supported_models = modelNames;
+      accountChanged = true;
+    }
     if (account.status === "quota_unavailable") {
       account.status = "active";
       account.error_message = null;
@@ -6710,7 +6761,10 @@ async function handleApiProxy(request, env, ctx, customPath, apiType) {
         }
         console.warn(`[retry] Wait budget exhausted (${RETRY_WAIT_BUDGET_MS}ms); returning HTTP ${currentStatus} without further retries.`);
       }
-      const failoverStatus = currentStatus === 401 || currentStatus === 403 || currentStatus === 408 || currentStatus === 429 || currentStatus >= 500;
+      if (currentStatus === 404 && mode === "antigravity") {
+        markAccountModelUnsupported(username, currentAccount.id, resolvedModel);
+      }
+      const failoverStatus = currentStatus === 401 || currentStatus === 403 || currentStatus === 404 || currentStatus === 408 || currentStatus === 429 || currentStatus >= 500;
       if (hasNextAccount && failoverStatus) {
         console.warn(`[Multi-Account Failover] Account '${currentAccount.email || currentAccount.id}' returned ${currentStatus}${eligibilityReason ? ` (${eligibilityReason})` : ""}. Failing over to next account...`);
         shouldFailoverToNext = true;

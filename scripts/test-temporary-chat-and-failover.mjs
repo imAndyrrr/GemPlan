@@ -548,6 +548,46 @@ try {
     assert.equal(target.tokens.access_token, "verified-token");
     console.log("PASS: account API recheck restores error account to active state");
   }
+
+  {
+    // 404 Requested entity was not found fails over to next account
+    const user = makeUser([
+      makeAccount("acc-404-first", { priority: 100 }),
+      makeAccount("acc-404-second", { priority: 0 })
+    ]);
+    const kv = new MockKV({
+      "key:sk-runtime-test": "failover-404-user",
+      "user:failover-404-user": JSON.stringify(user)
+    });
+    const seenTokens = [];
+    globalThis.fetch = async (_url, init = {}) => {
+      const auth = init.headers?.Authorization || init.headers?.authorization || "";
+      seenTokens.push(auth);
+      if (auth === "Bearer token-acc-404-first") {
+        return new Response(JSON.stringify({
+          error: {
+            code: 404,
+            message: "Requested entity was not found.",
+            status: "NOT_FOUND"
+          }
+        }), {
+          status: 404,
+          headers: { "Content-Type": "application/json" }
+        });
+      }
+      if (auth === "Bearer token-acc-404-second") {
+        return successResponse("failover-after-404");
+      }
+      throw new Error(`unexpected account was used: ${auth}`);
+    };
+    const response = await worker.fetch(chatRequest(), { GEMINI_KV: kv }, makeCtx());
+    const data = await response.json();
+    assert.equal(response.status, 200);
+    assert.equal(data.choices[0].message.content, "failover-after-404");
+    assert.ok(seenTokens.includes("Bearer token-acc-404-first"));
+    assert.ok(seenTokens.includes("Bearer token-acc-404-second"));
+    console.log("PASS: 404 NOT_FOUND on first account fails over to second account successfully");
+  }
 } finally {
   globalThis.fetch = originalFetch;
 }
