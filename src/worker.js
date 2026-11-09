@@ -4290,8 +4290,10 @@ async function handleDashboard(request, env) {
 
         const maxTotal = Math.max(100, ...daily.map(d => d.total_tokens || 0));
         const chartHeight = 150;
-        const colWidth = Math.max(45, Math.floor(660 / Math.max(1, daily.length)));
-        const totalSvgWidth = Math.max(660, daily.length * colWidth);
+        const leftMargin = 50;
+        const availableWidth = Math.max(600, daily.length * 45);
+        const colWidth = Math.max(45, Math.floor(availableWidth / Math.max(1, daily.length)));
+        const totalSvgWidth = leftMargin + daily.length * colWidth;
         const barWidth = Math.max(16, Math.floor(colWidth * 0.65));
 
         svg.setAttribute("viewBox", "0 0 " + totalSvgWidth + " 210");
@@ -4301,14 +4303,14 @@ async function handleDashboard(request, env) {
         for (let i = 0; i <= 4; i++) {
           const y = chartHeight - (chartHeight / 4) * i + 20;
           const val = Math.round((maxTotal / 4) * i);
-          svgHtml += '<line x1="0" y1="' + y + '" x2="' + totalSvgWidth + '" y2="' + y + '" stroke="#f1f3f5" stroke-width="1" />';
+          svgHtml += '<line x1="' + leftMargin + '" y1="' + y + '" x2="' + totalSvgWidth + '" y2="' + y + '" stroke="#f1f3f5" stroke-width="1" />';
           if (i > 0) {
             svgHtml += '<text x="4" y="' + (y - 3) + '" fill="#adb5bd" font-size="10" font-family="sans-serif">' + fmtTokens(val) + '</text>';
           }
         }
 
         daily.forEach((d, idx) => {
-          const x = idx * colWidth + Math.floor((colWidth - barWidth) / 2);
+          const x = leftMargin + idx * colWidth + Math.floor((colWidth - barWidth) / 2);
           const total = d.total_tokens || 0;
 
           const cachedTokens = d.cached_tokens || 0;
@@ -4347,10 +4349,12 @@ async function handleDashboard(request, env) {
             barParts += '<rect x="' + x + '" y="' + (baseBottom - 2) + '" width="' + barWidth + '" height="' + 2 + '" fill="#dee2e6" rx="1" />';
           }
 
-          const labelTop = total > 0 ? '<text x="' + (x + barWidth / 2) + '" y="' + (currentY - 4) + '" text-anchor="middle" fill="#6c757d" font-size="10" font-weight="bold" font-family="sans-serif">' + fmtTokens(total) + '</text>' : '';
+          const labelY = currentY < 32 ? Math.min(chartHeight + 10, currentY + 14) : (currentY - 4);
+          const labelFill = currentY < 32 ? "#ffffff" : "#6c757d";
+          const labelTop = total > 0 ? '<text x="' + (x + barWidth / 2) + '" y="' + labelY + '" text-anchor="middle" fill="' + labelFill + '" font-size="10" font-weight="bold" font-family="sans-serif">' + fmtTokens(total) + '</text>' : '';
           const dateShort = d.date.length >= 10 ? d.date.slice(5) : d.date;
           const labelDate = '<text x="' + (x + barWidth / 2) + '" y="' + (baseBottom + 16) + '" text-anchor="middle" fill="#495057" font-size="11" font-family="sans-serif">' + dateShort + '</text>';
-          const hoverArea = '<rect x="' + (idx * colWidth) + '" y="0" width="' + colWidth + '" height="210" fill="transparent" style="cursor:pointer;" onmouseover="showTokenBarInfo(' + idx + ')" onclick="showTokenBarInfo(' + idx + ')" />';
+          const hoverArea = '<rect x="' + (leftMargin + idx * colWidth) + '" y="0" width="' + colWidth + '" height="210" fill="transparent" style="cursor:pointer;" onmouseover="showTokenBarInfo(' + idx + ')" onclick="showTokenBarInfo(' + idx + ')" />';
 
           svgHtml += '<g class="bar-group-' + idx + '">' + barParts + labelTop + labelDate + hoverArea + '</g>';
         });
