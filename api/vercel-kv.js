@@ -70,25 +70,71 @@ export class FileBackedKV {
   constructor(entries = {}, storagePath = null) {
     this.store = new Map(Object.entries(entries));
     this.storagePath = storagePath || path.resolve(process.cwd(), "data/gemplan-store.json");
+    this.lockPath = `${this.storagePath}.lock`;
+    this.lastFileMtimeMs = 0;
     this.loadFromFile();
+  }
+
+  withLock(fn) {
+    const started = Date.now();
+    while (true) {
+      try {
+        const fd = fs.openSync(this.lockPath, "wx");
+        fs.closeSync(fd);
+        break;
+      } catch (err) {
+        if (err?.code !== "EEXIST") throw err;
+        try {
+          const stat = fs.statSync(this.lockPath);
+          if (Date.now() - stat.mtimeMs > 10000) {
+            fs.rmSync(this.lockPath, { force: true });
+            continue;
+          }
+        } catch {}
+        if (Date.now() - started > 5000) {
+          console.warn("[FileBackedKV] lock timeout, proceeding anyway");
+          break;
+        }
+        const sleepEnd = Date.now() + 10 + Math.random() * 20;
+        while (Date.now() < sleepEnd) {}
+      }
+    }
+    try {
+      return fn();
+    } finally {
+      try { fs.rmSync(this.lockPath, { force: true }); } catch {}
+    }
+  }
+
+  checkAndReloadIfChanged() {
+    if (!this.storagePath) return;
+    try {
+      if (fs.existsSync(this.storagePath)) {
+        const stat = fs.statSync(this.storagePath);
+        if (stat.mtimeMs > this.lastFileMtimeMs) {
+          this.loadFromFile();
+        }
+      }
+    } catch {}
   }
 
   loadFromFile() {
     if (!this.storagePath) return;
     try {
       if (fs.existsSync(this.storagePath)) {
+        const stat = fs.statSync(this.storagePath);
         const raw = fs.readFileSync(this.storagePath, "utf8");
         const data = JSON.parse(raw);
         if (data && typeof data === "object") {
           const now = Date.now();
+          this.store.clear();
           for (const [k, v] of Object.entries(data)) {
             if (!v?.expiresAt || v.expiresAt > now) {
-              if (!this.store.has(k)) {
-                this.store.set(k, v);
-              }
+              this.store.set(k, v);
             }
           }
         }
+        this.lastFileMtimeMs = stat.mtimeMs;
       }
     } catch (e) {
       console.warn("[FileBackedKV] Failed to load from file:", e.message || e);
@@ -138,34 +184,64 @@ export class FileBackedKV {
     this.saveToFile();
   }
 
-  saveToFile() {
+  saveToFile(deletedKey = null) {
     if (!this.storagePath) return;
-    let tempPath = null;
-    try {
-      const dir = path.dirname(this.storagePath);
-      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-      const obj = {};
-      const now = Date.now();
-      for (const [k, v] of this.store.entries()) {
-        if (!v?.expiresAt || v.expiresAt > now) {
-          obj[k] = v;
+    this.withLock(() => {
+      let tempPath = null;
+      try {
+        const dir = path.dirname(this.storagePath);
+        if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+
+        // Merge with newest disk content first so writes from other workers aren't overwritten
+        if (fs.existsSync(this.storagePath)) {
+          try {
+            const raw = fs.readFileSync(this.storagePath, "utf8");
+            const diskData = JSON.parse(raw);
+            if (diskData && typeof diskData === "object") {
+              const now = Date.now();
+              for (const [k, v] of Object.entries(diskData)) {
+                if (k === deletedKey) continue;
+                if (!v?.expiresAt || v.expiresAt > now) {
+                  // If our memory doesn't have it, keep disk version
+                  if (!this.store.has(k)) {
+                    this.store.set(k, v);
+                  }
+                }
+              }
+            }
+          } catch {}
         }
+
+        if (deletedKey) {
+          this.store.delete(deletedKey);
+        }
+
+        const obj = {};
+        const now = Date.now();
+        for (const [k, v] of this.store.entries()) {
+          if (!v?.expiresAt || v.expiresAt > now) {
+            obj[k] = v;
+          }
+        }
+        tempPath = `${this.storagePath}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`;
+        fs.writeFileSync(tempPath, JSON.stringify(obj, null, 2), "utf8");
+        fs.renameSync(tempPath, this.storagePath);
+        const stat = fs.statSync(this.storagePath);
+        this.lastFileMtimeMs = stat.mtimeMs;
+      } catch (e) {
+        if (tempPath && fs.existsSync(tempPath)) {
+          try { fs.unlinkSync(tempPath); } catch {}
+        }
+        console.warn("[FileBackedKV] Failed to save atomically to file:", e.message || e);
       }
-      tempPath = `${this.storagePath}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`;
-      fs.writeFileSync(tempPath, JSON.stringify(obj, null, 2), "utf8");
-      fs.renameSync(tempPath, this.storagePath);
-    } catch (e) {
-      if (tempPath && fs.existsSync(tempPath)) {
-        try { fs.unlinkSync(tempPath); } catch {}
-      }
-      console.warn("[FileBackedKV] Failed to save atomically to file:", e.message || e);
-    }
+    });
   }
 
   async get(key, type) {
     if (Array.isArray(key)) {
       return new Map(await Promise.all(key.map(async (item) => [item, await this.get(item, type)])));
     }
+    this.checkAndReloadIfChanged();
     const entry = this.store.get(key);
     if (!entry || (entry.expiresAt && entry.expiresAt <= Date.now())) {
       if (entry) {
@@ -193,10 +269,11 @@ export class FileBackedKV {
 
   async delete(key) {
     this.store.delete(key);
-    this.saveToFile();
+    this.saveToFile(key);
   }
 
   async list({ prefix = "", limit = 100, cursor = "0" } = {}) {
+    this.checkAndReloadIfChanged();
     const now = Date.now();
     const keys = [...this.store.entries()]
       .filter(([k, v]) => k.startsWith(prefix) && (!v?.expiresAt || v.expiresAt > now))

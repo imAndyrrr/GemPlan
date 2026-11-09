@@ -3861,6 +3861,14 @@ async function handleDashboard(request, env) {
           var data;
           try { data = await res.json(); } catch (e) { data = {}; }
           if (!res.ok) {
+            if (res.status === 401 && (data.is_upstream_auth_error || data.error?.includes("\u6388\u6743") || data.error?.includes("Token"))) {
+              statusEl.innerHTML = '<span style="color:red;">\u26A0\uFE0F Google \u8D26\u53F7\u51ED\u8BC1\u5DF2\u5931\u6548\uFF1A' + agEscHtml(data.error) + '</span>';
+              return;
+            }
+            if (res.status === 401) {
+              statusEl.innerHTML = '<span style="color:red;">\u26A0\uFE0F \u63A7\u5236\u53F0\u767B\u5F55\u4F1A\u8BDD\u5DF2\u8FC7\u671F\uFF0C\u8BF7\u5237\u65B0\u9875\u9762\u91CD\u65B0\u767B\u5F55</span>';
+              return;
+            }
             statusEl.innerHTML = '<span style="color:red;">\u2716 ' + agEscHtml(data.error || ("HTTP " + res.status)) + '</span>';
             return;
           }
@@ -5397,7 +5405,8 @@ async function fetchAccountAntigravityQuotaData(account, username, env, ctx, for
         return {
           error: "Antigravity Token \u5DF2\u8FC7\u671F\u4E14\u5237\u65B0\u5931\u8D25\uFF0C\u8BF7\u91CD\u65B0\u5728\u63A7\u5236\u53F0\u5B8C\u6210\u6388\u6743",
           status: 401,
-          account_changed: true
+          account_changed: true,
+          is_upstream_auth_error: true
         };
       }
       return {
@@ -5739,7 +5748,7 @@ async function handleAntigravityQuota(request, env, ctx) {
   const forceRefresh = url.searchParams.get("refresh") === "1";
   const targetAccountId = url.searchParams.get("account_id");
   const result = await fetchAntigravityQuotaData(user, username, env, ctx, forceRefresh, targetAccountId);
-  if (result.error) return jsonResponse({ error: result.error }, result.status || 502);
+  if (result.error) return jsonResponse({ error: result.error, is_upstream_auth_error: Boolean(result.is_upstream_auth_error) }, result.status || 502);
   return jsonResponse(result.data);
 }
 __name(handleAntigravityQuota, "handleAntigravityQuota");

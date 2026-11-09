@@ -88,24 +88,33 @@ class CachedKvWrapper {
     this.mem = new Map();
   }
   async get(key, type) {
-    if (typeof key === "string" && (key.startsWith("user:") || key.startsWith("key:") || key.startsWith("path:"))) {
+    if (typeof key === "string" && (key.startsWith("user:") || key.startsWith("key:") || key.startsWith("path:") || key.startsWith("session:"))) {
       const hit = this.mem.get(key);
       if (hit && hit.expiresAt > Date.now()) {
         return type === "json" ? (typeof hit.val === "string" ? JSON.parse(hit.val) : structuredClone(hit.val)) : hit.val;
       }
     }
     const val = await this.kv.get(key, type);
-    if (val !== null && val !== undefined && typeof key === "string" && (key.startsWith("user:") || key.startsWith("key:") || key.startsWith("path:"))) {
-      this.mem.set(key, { val, expiresAt: Date.now() + 60000 });
+    if (val !== null && val !== undefined && typeof key === "string") {
+      if (key.startsWith("session:")) {
+        // Cache session for 30s in worker memory to speed up requests
+        this.mem.set(key, { val, expiresAt: Date.now() + 30000 });
+      } else if (key.startsWith("user:") || key.startsWith("key:") || key.startsWith("path:")) {
+        this.mem.set(key, { val, expiresAt: Date.now() + 60000 });
+      }
     }
     return val;
   }
   async put(key, value, options) {
-    if (typeof key === "string") this.mem.delete(key);
+    if (typeof key === "string") {
+      this.mem.delete(key);
+    }
     return this.kv.put(key, value, options);
   }
   async delete(key) {
-    if (typeof key === "string") this.mem.delete(key);
+    if (typeof key === "string") {
+      this.mem.delete(key);
+    }
     return this.kv.delete(key);
   }
   async list(options) {
